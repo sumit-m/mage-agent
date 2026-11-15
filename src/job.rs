@@ -7,7 +7,8 @@ use crate::command;
 use crate::prompt::Event;
 use crate::{proc, repo, strip, terminal};
 
-const MAGE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Includes time spent waiting in mage's queue; stays under buzz-acp's 2-hour turn cap.
+const MAGE_TIMEOUT: Duration = Duration::from_secs(100 * 60);
 const BUZZ_TIMEOUT: Duration = Duration::from_secs(180);
 const IMAGE_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "webp", "gif"];
 
@@ -99,7 +100,7 @@ fn handle(config: &Config, event: &Event, work: &Path) -> Reply {
     let mut content = without_lines_mentioning(&terminal::clean(&output.combined()), work);
     if output.timed_out {
         content.push_str(&format!(
-            "\nStopped after {} minutes.",
+            "\nStopped waiting after {} minutes; mage may still finish the job.",
             MAGE_TIMEOUT.as_secs() / 60
         ));
     } else if !output.success {

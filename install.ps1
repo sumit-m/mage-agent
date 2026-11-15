@@ -32,11 +32,9 @@ try {
 }
 
 if ($MageSource) {
-    Copy-Item (Join-Path $MageSource 'mage.exe') $InstallDir -Force
-    foreach ($ini in 'config.ini', 'presets.ini') {
-        $source = Join-Path $MageSource $ini
-        $target = Join-Path $InstallDir $ini
-        if ((Test-Path $source) -and -not (Test-Path $target)) { Copy-Item $source $target }
+    foreach ($file in 'mage.exe', 'config.ini', 'presets.ini') {
+        $source = Join-Path $MageSource $file
+        if (Test-Path $source) { Copy-Item $source $InstallDir -Force }
     }
 }
 if (-not (Test-Path (Join-Path $InstallDir 'mage.exe'))) {

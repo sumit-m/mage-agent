@@ -1,7 +1,12 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// How long to keep reading output after the process exits. A child it spawned
+/// (mage's queue worker) can inherit the pipes and hold them open long after.
+const PIPE_GRACE: Duration = Duration::from_secs(2);
 
 pub struct Output {
     pub success: bool,
@@ -78,21 +83,66 @@ pub fn run(mut cmd: Command, stdin: Option<&str>, timeout: Duration) -> std::io:
         std::thread::sleep(Duration::from_millis(100));
     };
 
+    let pipes_close_by = Instant::now() + PIPE_GRACE;
     Ok(Output {
         success: !timed_out && status.is_some_and(|s| s.success()),
         code: status.and_then(|s| s.code()),
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        stdout: stdout.finish(pipes_close_by),
+        stderr: stderr.finish(pipes_close_by),
         timed_out,
     })
 }
 
-fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<String> {
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut bytes);
-        }
+struct Drain {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    eof: mpsc::Receiver<()>,
+}
+
+impl Drain {
+    fn finish(self, deadline: Instant) -> String {
+        let _ = self
+            .eof
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let bytes = self.bytes.lock().unwrap_or_else(|p| p.into_inner());
         String::from_utf8_lossy(&bytes).into_owned()
-    })
+    }
+}
+
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> Drain {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let (tx, eof) = mpsc::channel();
+    let sink = bytes.clone();
+    std::thread::spawn(move || {
+        if let Some(mut pipe) = pipe {
+            let mut chunk = [0u8; 8192];
+            while let Ok(n @ 1..) = pipe.read(&mut chunk) {
+                sink.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .extend_from_slice(&chunk[..n]);
+            }
+        }
+        let _ = tx.send(());
+    });
+    Drain { bytes, eof }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn returns_once_the_process_exits_even_if_a_grandchild_holds_the_pipe() {
+        let mut cmd = command(Path::new("cmd"));
+        cmd.args(["/C", "echo done& start /b ping -n 15 127.0.0.1 >nul"]);
+        let started = Instant::now();
+        let output = run(cmd, None, Duration::from_secs(30)).unwrap();
+        assert!(output.success);
+        assert_eq!(output.stdout.trim(), "done");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= PIPE_GRACE,
+            "the grandchild should hold the pipe: {elapsed:?}"
+        );
+        assert!(elapsed < PIPE_GRACE * 2, "{elapsed:?}");
+    }
 }

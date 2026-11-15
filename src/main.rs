@@ -1,10 +1,12 @@
 //! mage-agent — a Buzz ACP harness with no LLM behind it.
 //!
 //! buzz-acp delivers each `@mage` mention as an ACP `session/prompt`. Every new
-//! event runs on its own thread so the mage CLI's single-job rule decides what
-//! happens to overlapping requests. A prompt is answered once its jobs finish;
-//! a `session/cancel` (buzz-acp's steer path) answers it at once and leaves the
-//! jobs running so their results still get posted.
+//! event runs on its own thread; mage queues overlapping requests itself. A
+//! prompt is answered once its jobs finish; a `session/cancel` (buzz-acp's steer
+//! path) answers it at once and leaves the jobs running so their results still
+//! get posted. While a prompt is open it sends a keepalive every few minutes,
+//! since buzz-acp times out a silent turn and a job can wait a while in mage's
+//! queue.
 
 mod command;
 mod job;
@@ -18,11 +20,15 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
 const SEEN_CAPACITY: usize = 5000;
+/// Well inside buzz-acp's idle timeout (25 minutes by default).
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 struct Agent {
     config: Arc<job::Config>,
@@ -153,13 +159,34 @@ impl Agent {
             })
             .collect();
 
+        let (jobs_done, wait) = mpsc::channel::<()>();
+        let agent = self.clone();
+        let (keepalive_session, keepalive_answered) = (session.clone(), answered.clone());
+        std::thread::spawn(move || {
+            while let Err(RecvTimeoutError::Timeout) = wait.recv_timeout(KEEPALIVE_INTERVAL) {
+                if keepalive_answered.load(Ordering::SeqCst) {
+                    break;
+                }
+                agent.keepalive(&keepalive_session);
+            }
+        });
+
         let agent = self.clone();
         std::thread::spawn(move || {
             for job in jobs {
                 let _ = job.join();
             }
+            drop(jobs_done);
             agent.finish(&session, &answered, &id, "end_turn");
         });
+    }
+
+    fn keepalive(&self, session: &str) {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": { "sessionId": session, "update": { "sessionUpdate": "keepalive" } }
+        }));
     }
 
     fn cancel(&self, session: &str) {

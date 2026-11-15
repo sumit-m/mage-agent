@@ -26,7 +26,7 @@ commit the image and its `.json` sidecar to a repository bound to the channel.
 - Commits go straight to the repository's default branch, using the agent's Git
   identity from the harness. A protected branch rejects the push and the reply
   says so; the image is still posted.
-- Overlapping requests each run the CLI, so mage's single-job rule answers them.
+- Overlapping requests each run the CLI, which queues them and runs one at a time.
 
 ## Install
 
@@ -35,8 +35,8 @@ commit the image and its `.json` sidecar to a repository bound to the channel.
 ```
 
 This builds the release binary, puts `mage-agent.exe` (and, with
-`-MageSource`, `mage.exe`, `config.ini`, `presets.ini`) in
-`%LOCALAPPDATA%\Programs\mage`, and writes
+`-MageSource`, `mage.exe`, `config.ini`, `presets.ini`, replacing any installed
+copies) in `%LOCALAPPDATA%\Programs\mage`, and writes
 `%APPDATA%\xyz.block.buzz.app.dev\custom_harnesses\mage.json`. `just reset`
 deletes that file; run the script again afterwards. Use `-App prod` for the
 installed app.
@@ -62,7 +62,9 @@ event blocks (`Event ID`, `Channel`, `Content`, `Tags`) and the `--reply-to`
 anchor from `<context>`, and ignores context sections and events from an earlier
 turn. Each new event runs on its own thread; the prompt is answered when its
 jobs finish. On `session/cancel` (Buzz's steer path when a second mention arrives
-mid-job) it answers `cancelled` at once and lets the job finish and post.
+mid-job) it answers `cancelled` at once and lets the job finish and post. While a
+prompt is open it sends a `keepalive` session update every 5 minutes, so a job
+waiting in mage's queue doesn't trip buzz-acp's idle timeout.
 
 The prompt layout is written for models, not as an API: if Buzz changes it,
 `src/prompt.rs` and its tests are the place to update.
