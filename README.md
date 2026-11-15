@@ -27,6 +27,10 @@ commit the image and its `.json` sidecar to a repository bound to the channel.
   identity from the harness. A protected branch rejects the push and the reply
   says so; the image is still posted.
 - Overlapping requests each run the CLI, which queues them and runs one at a time.
+- Repositories are reached through a temporary blobless clone (`--depth 1
+  --filter=blob:none`) deleted with the job: a save uploads only the new files
+  and `--src` fetches only that file. A relay that doesn't serve partial clones
+  sends every file of the latest commit instead.
 
 ## Install
 
@@ -50,7 +54,6 @@ add it to the channels it should serve.
 |---|---|
 | `MAGE_CLI` | `mage.exe` next to `mage-agent.exe`, else `mage` on `PATH` |
 | `BUZZ_CLI` | `buzz` on `PATH` (Buzz puts its sidecars there) |
-| `MAGE_AGENT_HOME` | `%LOCALAPPDATA%\mage-agent` (repository clones live in `repos\`) |
 
 Buzz supplies `BUZZ_RELAY_URL`, `BUZZ_PRIVATE_KEY`, the Git credential helper and
 the commit identity. `mage.exe` runs without the Buzz keys in its environment.

@@ -255,15 +255,11 @@ fn config() -> job::Config {
                 .filter(|p| p.is_file())
         })
         .unwrap_or_else(|| PathBuf::from("mage"));
-    let data_root = env_path("MAGE_AGENT_HOME")
-        .or_else(|| env_path("LOCALAPPDATA").map(|d| d.join("mage-agent")))
-        .unwrap_or_else(|| std::env::temp_dir().join("mage-agent"));
     job::Config {
         mage,
         buzz: env_path("BUZZ_CLI").unwrap_or_else(|| PathBuf::from("buzz")),
         display_name: std::env::var("BUZZ_ACP_DISPLAY_NAME").ok(),
         work_root: std::env::temp_dir().join("mage-agent"),
-        cache_root: data_root.join("repos"),
     }
 }
 

@@ -1,22 +1,23 @@
-//! `--repo [<repo>:]<path>`: commit generated files to a Buzz repository bound
-//! to the channel, using a mage-agent–owned clone so no shared checkout is touched.
+//! `--repo [<repo>:]<path>` and `--src <repo>:<path>`: Buzz repositories bound
+//! to the channel, reached through a temporary blobless clone in the job's work
+//! folder. It holds the latest commit and its folder listings but no file
+//! contents, so saving uploads only the new files and reading fetches only the
+//! one file asked for. A relay without partial-clone support sends every file
+//! instead; that still works, just slower.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::Deserialize;
 
 use crate::proc;
 
-static GIT_LOCK: Mutex<()> = Mutex::new(());
 const GIT_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RepoInfo {
     pub id: String,
     pub name: Option<String>,
-    pub owner: String,
     pub clone: Option<String>,
     pub branch: String,
 }
@@ -84,10 +85,12 @@ pub fn resolve_target(spec: &str, repos: &[RepoInfo]) -> Result<Target, String> 
         None => match repos {
             [only] => (only, spec),
             [] => return Err("this channel has no bound repository".into()),
-            _ => return Err(format!(
+            _ => {
+                return Err(format!(
                 "this channel has several repositories; use `--repo <repo>:{spec}` with one of {}",
                 names()
-            )),
+            ))
+            }
         },
     };
     Ok(Target {
@@ -118,7 +121,7 @@ fn validate_path(path: &str) -> Result<String, String> {
 /// else is a directory that keeps mage's file names.
 fn destinations(
     path: &str,
-    checkout: &Path,
+    is_existing_folder: impl Fn(&str) -> bool,
     images: &[PathBuf],
     sidecars: &[PathBuf],
 ) -> Result<Vec<(PathBuf, String)>, String> {
@@ -127,7 +130,7 @@ fn destinations(
     let last = trimmed.rsplit('/').next().unwrap_or("");
     let names_file = !path.ends_with('/')
         && Path::new(last).extension().is_some()
-        && !checkout.join(trimmed).is_dir();
+        && !is_existing_folder(trimmed);
 
     if !names_file {
         let dir = if trimmed.is_empty() || trimmed == "." {
@@ -165,106 +168,156 @@ fn destinations(
     Ok(placed)
 }
 
+/// Commits the files on top of the default branch's latest commit without
+/// checking anything out: the new files are hashed into the clone and added to
+/// an index read from the latest folder listings.
 pub fn save(
-    cache_root: &Path,
+    work: &Path,
     target: &Target,
     images: &[PathBuf],
     sidecars: &[PathBuf],
     message: &str,
 ) -> Result<Saved, String> {
-    let _guard = GIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let repo = &target.repo;
-    let checkout = synced_checkout(cache_root, repo)?;
-    let placed = destinations(&target.path, &checkout, images, sidecars)?;
+    let clone = work.join("repo-save");
+    let mut base = blobless_clone(&clone, repo)?;
+    let placed = destinations(
+        &target.path,
+        |folder| {
+            base.as_deref().is_some_and(|commit| {
+                git(&clone, &["cat-file", "-t", &format!("{commit}:{folder}")])
+                    .is_ok_and(|kind| kind == "tree")
+            })
+        },
+        images,
+        sidecars,
+    )?;
+    let mut entries = Vec::new();
     for (src, rel) in &placed {
-        let dest = checkout.join(rel);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        std::fs::copy(src, &dest).map_err(|e| format!("copy to {rel}: {e}"))?;
+        let oid = git(
+            &clone,
+            &[
+                "hash-object",
+                "-w",
+                "--no-filters",
+                "--",
+                &src.to_string_lossy(),
+            ],
+        )
+        .map_err(|e| format!("could not add {rel}: {e}"))?;
+        entries.push((oid, rel.as_str()));
     }
 
-    let rels: Vec<String> = placed.into_iter().map(|(_, rel)| rel).collect();
-    let mut add = vec!["add", "--"];
-    add.extend(rels.iter().map(String::as_str));
-    git(&checkout, &add)?;
-    git(&checkout, &["commit", "--cleanup=verbatim", "-m", message])
-        .map_err(|e| format!("commit failed: {e}"))?;
-
-    let refspec = format!("HEAD:refs/heads/{}", repo.branch);
-    if let Err(first) = git(&checkout, &["push", "origin", &refspec]) {
-        let retried = git(&checkout, &["pull", "--rebase", "origin", &repo.branch])
-            .and_then(|_| git(&checkout, &["push", "origin", &refspec]));
-        if let Err(second) = retried {
-            let _ = git(&checkout, &["rebase", "--abort"]);
-            return Err(format!(
-                "push rejected: {}",
-                if second.is_empty() { first } else { second }
-            ));
-        }
+    let refspec = |commit: &str| format!("{commit}:refs/heads/{}", repo.branch);
+    let mut commit = commit_on(&clone, base.as_deref(), &entries, message)?;
+    if let Err(first) = git(&clone, &["push", "-q", "origin", &refspec(&commit)]) {
+        // The branch moved on: rebuild the same commit on its new tip.
+        base =
+            Some(fetch_tip(&clone, &repo.branch).map_err(|_| format!("push rejected: {first}"))?);
+        commit = commit_on(&clone, base.as_deref(), &entries, message)?;
+        git(&clone, &["push", "-q", "origin", &refspec(&commit)])
+            .map_err(|second| format!("push rejected: {second}"))?;
     }
 
     Ok(Saved {
         label: repo.label().to_string(),
-        files: rels,
-        commit: git(&checkout, &["rev-parse", "--short", "HEAD"])?,
+        files: placed.into_iter().map(|(_, rel)| rel).collect(),
+        commit: git(&clone, &["rev-parse", "--short", &commit])?,
     })
 }
 
-/// Copies `target.path` from the repository's default branch into `dest_dir`,
-/// so a later save to the same clone cannot change it mid-job.
-pub fn fetch_file(cache_root: &Path, target: &Target, dest_dir: &Path) -> Result<PathBuf, String> {
-    let _guard = GIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+/// Writes `target.path` from the default branch into `dest_dir`, fetching only
+/// that file.
+pub fn fetch_file(work: &Path, target: &Target, dest_dir: &Path) -> Result<PathBuf, String> {
     let repo = &target.repo;
-    let checkout = synced_checkout(cache_root, repo)?;
-    let source = checkout.join(&target.path);
-    if !source.is_file() {
-        return Err(format!(
+    let clone = work.join("repo-src");
+    let not_a_file = || {
+        format!(
             "`{}` is not a file on `{}` in `{}`",
             target.path,
             repo.branch,
             repo.label()
-        ));
+        )
+    };
+    let base = blobless_clone(&clone, repo)?.ok_or_else(not_a_file)?;
+    let spec = format!("{base}:{}", target.path);
+    if git(&clone, &["cat-file", "-t", &spec]).ok().as_deref() != Some("blob") {
+        return Err(not_a_file());
     }
+    git(&clone, &["checkout", &base, "--", &target.path])
+        .map_err(|e| format!("could not fetch {}: {e}", target.path))?;
+    let source = clone.join(&target.path);
     let dest = dest_dir.join(source.file_name().ok_or("path names no file")?);
     std::fs::copy(&source, &dest).map_err(|e| format!("copy {}: {e}", target.path))?;
     Ok(dest)
 }
 
-fn synced_checkout(cache_root: &Path, repo: &RepoInfo) -> Result<PathBuf, String> {
-    let clone_url = repo
+/// Clones only the default branch's latest commit and folder listings into
+/// `dir`, returning that commit, or `None` when the branch has no commits yet.
+fn blobless_clone(dir: &Path, repo: &RepoInfo) -> Result<Option<String>, String> {
+    let url = repo
         .clone
         .as_deref()
         .ok_or_else(|| format!("repository `{}` publishes no clone URL", repo.label()))?;
-    let owner_prefix: String = repo.owner.chars().take(8).collect();
-    let checkout = cache_root.join(format!("{owner_prefix}-{}", repo.id));
-    sync_checkout(&checkout, clone_url, &repo.branch)?;
-    Ok(checkout)
+    let _ = std::fs::remove_dir_all(dir);
+    let parent = dir.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let branch_ref = format!("refs/heads/{}", repo.branch);
+    let heads = git(parent, &["ls-remote", url, &branch_ref])
+        .map_err(|e| format!("could not reach `{}`: {e}", repo.label()))?;
+    let dir_arg = dir.to_string_lossy();
+    if heads.is_empty() {
+        git(parent, &["init", "-q", &dir_arg])?;
+        git(dir, &["remote", "add", "origin", url])?;
+        return Ok(None);
+    }
+    git(
+        parent,
+        &[
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            "--filter=blob:none",
+            "--no-checkout",
+            "--branch",
+            &repo.branch,
+            url,
+            &dir_arg,
+        ],
+    )
+    .map_err(|e| format!("clone failed: {e}"))?;
+    git(dir, &["rev-parse", "HEAD"]).map(Some)
 }
 
-fn sync_checkout(checkout: &Path, clone_url: &str, branch: &str) -> Result<(), String> {
-    if !checkout.join(".git").is_dir() {
-        if let Some(parent) = checkout.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        let _ = std::fs::remove_dir_all(checkout);
-        git(
-            Path::new("."),
-            &["clone", clone_url, &checkout.to_string_lossy()],
-        )
-        .map_err(|e| format!("clone failed: {e}"))?;
+fn fetch_tip(clone: &Path, branch: &str) -> Result<String, String> {
+    git(clone, &["fetch", "-q", "--depth", "1", "origin", branch])?;
+    git(clone, &["rev-parse", "FETCH_HEAD"])
+}
+
+/// A commit whose tree is `base`'s plus `entries` (blob id, repository path).
+fn commit_on(
+    clone: &Path,
+    base: Option<&str>,
+    entries: &[(String, &str)],
+    message: &str,
+) -> Result<String, String> {
+    match base {
+        Some(commit) => git(clone, &["read-tree", commit])?,
+        None => git(clone, &["read-tree", "--empty"])?,
+    };
+    for (oid, rel) in entries {
+        let info = format!("100644,{oid},{rel}");
+        git(clone, &["update-index", "--add", "--cacheinfo", &info])?;
     }
-    git(checkout, &["fetch", "origin", "--prune"]).map_err(|e| format!("fetch failed: {e}"))?;
-    let remote = format!("origin/{branch}");
-    if git(checkout, &["rev-parse", "--verify", "--quiet", &remote]).is_ok() {
-        git(checkout, &["checkout", "-f", "-B", branch, &remote])?;
-        git(checkout, &["reset", "--hard", &remote])?;
-    } else {
-        git(checkout, &["checkout", "-f", "--orphan", branch])?;
-        let _ = git(checkout, &["rm", "-rf", "--cached", "--quiet", "."]);
+    // Without --missing-ok, write-tree checks every file exists and so
+    // downloads all of the existing ones.
+    let tree = git(clone, &["write-tree", "--missing-ok"])?;
+    let mut args = vec!["commit-tree", tree.as_str(), "-m", message];
+    if let Some(commit) = base {
+        args.extend(["-p", commit]);
     }
-    git(checkout, &["clean", "-fdq"])?;
-    Ok(())
+    git(clone, &args).map_err(|e| format!("commit failed: {e}"))
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -286,7 +339,6 @@ mod tests {
         RepoInfo {
             id: id.into(),
             name: Some(name.into()),
-            owner: "ab".repeat(32),
             clone: Some(format!("https://relay/git/x/{id}")),
             branch: "main".into(),
         }
@@ -340,25 +392,152 @@ mod tests {
 
     #[test]
     fn directory_and_file_destinations() {
-        let tmp = std::env::temp_dir().join("mage-agent-dest-test");
+        let no_folders = |_: &str| false;
         let images = [PathBuf::from("out/h1.jpg")];
         let sidecars = [PathBuf::from("out/h1.json")];
 
-        let d = destinations("art/", &tmp, &images, &sidecars).unwrap();
+        let d = destinations("art/", no_folders, &images, &sidecars).unwrap();
         assert_eq!(d[0].1, "art/h1.jpg");
         assert_eq!(d[1].1, "art/h1.json");
 
-        let d = destinations("art/fox", &tmp, &images, &sidecars).unwrap();
+        let d = destinations("art/fox", no_folders, &images, &sidecars).unwrap();
         assert_eq!(d[0].1, "art/fox/h1.jpg");
 
-        let d = destinations("", &tmp, &images, &sidecars).unwrap();
+        let d = destinations("", no_folders, &images, &sidecars).unwrap();
         assert_eq!(d[0].1, "h1.jpg");
 
-        let d = destinations("art/fox.png", &tmp, &images, &sidecars).unwrap();
+        let d = destinations("art/fox.png", no_folders, &images, &sidecars).unwrap();
         assert_eq!(d[0].1, "art/fox.jpg");
         assert_eq!(d[1].1, "art/fox.json");
 
         let two = [PathBuf::from("a.jpg"), PathBuf::from("b.jpg")];
-        assert!(destinations("fox.jpg", &tmp, &two, &[]).is_err());
+        assert!(destinations("fox.jpg", no_folders, &two, &[]).is_err());
+    }
+
+    /// A bare repository served over `file://` with the relay's partial-clone
+    /// settings, optionally holding `assets/old.bin`.
+    fn served_repo(root: &Path, seeded: bool) -> RepoInfo {
+        let bare = root.join("remote.git");
+        let bare_arg = bare.to_string_lossy();
+        git(root, &["init", "-q", "--bare", "-b", "main", &bare_arg]).unwrap();
+        git(&bare, &["config", "uploadpack.allowFilter", "true"]).unwrap();
+        git(
+            &bare,
+            &["config", "uploadpack.allowReachableSHA1InWant", "true"],
+        )
+        .unwrap();
+        let url = format!(
+            "file:///{}",
+            bare_arg.replace('\\', "/").trim_start_matches('/')
+        );
+        if seeded {
+            let seed = root.join("seed");
+            git(root, &["init", "-q", "-b", "main", &seed.to_string_lossy()]).unwrap();
+            std::fs::create_dir_all(seed.join("assets")).unwrap();
+            std::fs::write(seed.join("assets/old.bin"), vec![7u8; 300_000]).unwrap();
+            git(&seed, &["add", "."]).unwrap();
+            git(&seed, &["commit", "-q", "-m", "seed"]).unwrap();
+            git(&seed, &["push", "-q", &url, "main"]).unwrap();
+        }
+        RepoInfo {
+            id: "art".into(),
+            name: Some("Art".into()),
+            clone: Some(url),
+            branch: "main".into(),
+        }
+    }
+
+    fn generated(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let out = root.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("h1.jpg"), b"jpeg bytes").unwrap();
+        std::fs::write(out.join("h1.json"), b"{\"prompt\":\"fox\"}").unwrap();
+        (vec![out.join("h1.jpg")], vec![out.join("h1.json")])
+    }
+
+    /// Buzz supplies the commit identity through the environment.
+    fn set_identity() {
+        for (key, value) in [
+            ("GIT_AUTHOR_NAME", "mage"),
+            ("GIT_AUTHOR_EMAIL", "mage@test"),
+            ("GIT_COMMITTER_NAME", "mage"),
+            ("GIT_COMMITTER_EMAIL", "mage@test"),
+        ] {
+            std::env::set_var(key, value);
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mage-agent-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn save_adds_files_without_downloading_existing_ones_and_src_fetches_one() {
+        set_identity();
+        let root = scratch("save");
+        let repo = served_repo(&root, true);
+        let (images, sidecars) = generated(&root);
+        let work = root.join("work");
+        let target = Target {
+            repo: repo.clone(),
+            path: "assets".into(),
+        };
+        let message = "@Mage gen a fox --repo assets\n\n# kept verbatim";
+        let saved = save(&work, &target, &images, &sidecars, message).unwrap();
+        assert_eq!(saved.files, ["assets/h1.jpg", "assets/h1.json"]);
+
+        let listing = git(
+            &work.join("repo-save"),
+            &["rev-list", "--objects", "--missing=print", "HEAD"],
+        )
+        .unwrap();
+        assert!(
+            listing.lines().any(|l| l.starts_with('?')),
+            "old.bin was downloaded: {listing}"
+        );
+
+        let bare = root.join("remote.git");
+        let tree = git(&bare, &["ls-tree", "-r", "--name-only", "main"]).unwrap();
+        assert_eq!(tree, "assets/h1.jpg\nassets/h1.json\nassets/old.bin");
+        let body = git(&bare, &["log", "-1", "--format=%B", "main"]).unwrap();
+        assert_eq!(body, message);
+
+        let dest = root.join("src");
+        std::fs::create_dir_all(&dest).unwrap();
+        let src = Target {
+            repo,
+            path: "assets/old.bin".into(),
+        };
+        let file = fetch_file(&root.join("work2"), &src, &dest).unwrap();
+        assert_eq!(std::fs::read(file).unwrap().len(), 300_000);
+
+        let absent = Target {
+            path: "assets/nope.jpg".into(),
+            ..src
+        };
+        let err = fetch_file(&root.join("work3"), &absent, &dest).unwrap_err();
+        assert!(err.contains("is not a file"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn save_starts_the_default_branch_of_an_empty_repository() {
+        set_identity();
+        let root = scratch("empty");
+        let repo = served_repo(&root, false);
+        let (images, sidecars) = generated(&root);
+        let target = Target {
+            repo,
+            path: "img/fox.png".into(),
+        };
+        let saved = save(&root.join("work"), &target, &images, &sidecars, "first").unwrap();
+        assert_eq!(saved.files, ["img/fox.jpg", "img/fox.json"]);
+        let bare = root.join("remote.git");
+        let tree = git(&bare, &["ls-tree", "-r", "--name-only", "main"]).unwrap();
+        assert_eq!(tree, "img/fox.jpg\nimg/fox.json");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

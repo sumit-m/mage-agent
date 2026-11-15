@@ -17,7 +17,6 @@ pub struct Config {
     pub buzz: PathBuf,
     pub display_name: Option<String>,
     pub work_root: PathBuf,
-    pub cache_root: PathBuf,
 }
 
 struct Attachment {
@@ -120,7 +119,9 @@ fn handle(config: &Config, event: &Event, work: &Path) -> Reply {
         }
     } else if let Some(spec) = request.repo.take() {
         content.push('\n');
-        content.push_str(&save_to_repo(config, event, &spec, &images, &sidecars));
+        content.push_str(&save_to_repo(
+            config, event, work, &spec, &images, &sidecars,
+        ));
     }
     let mut content = content.trim().to_string();
     if content.is_empty() {
@@ -132,6 +133,7 @@ fn handle(config: &Config, event: &Event, work: &Path) -> Reply {
 fn save_to_repo(
     config: &Config,
     event: &Event,
+    work: &Path,
     spec: &str,
     images: &[PathBuf],
     sidecars: &[PathBuf],
@@ -140,7 +142,7 @@ fn save_to_repo(
         .and_then(|repos| repo::resolve_target(spec, &repos))
         .and_then(|target| {
             repo::save(
-                &config.cache_root,
+                work,
                 &target,
                 images,
                 sidecars,
@@ -180,7 +182,7 @@ fn localize_repo_src(
     let target = repo::resolve_target(&value, &repos)?;
     let dest_dir = work.join("src");
     std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
-    let local = repo::fetch_file(&config.cache_root, &target, &dest_dir)?;
+    let local = repo::fetch_file(work, &target, &dest_dir)?;
     args[index] = format!("{prefix}{}", local.to_string_lossy());
     Ok(())
 }
