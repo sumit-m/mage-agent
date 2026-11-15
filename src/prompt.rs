@@ -39,6 +39,29 @@ pub fn parse_turn(text: &str) -> Turn {
     }
 }
 
+impl Event {
+    /// The message this one replies to inside a thread (NIP-10 `reply` marker).
+    pub fn parent_id(&self) -> Option<&str> {
+        self.tags.iter().find_map(|tag| match tag.as_slice() {
+            [kind, id, _, marker, ..] if kind == "e" && marker == "reply" && is_hex64(id) => {
+                Some(id.as_str())
+            }
+            _ => None,
+        })
+    }
+}
+
+/// Where `event`'s reply goes. buzz-acp derives one anchor per turn from its
+/// last event, so a batch spanning threads is placed per event instead: a
+/// thread message is answered beside itself (under its parent); a top-level one
+/// is threaded under itself only when the turn's anchor names it.
+pub fn reply_anchor_for(event: &Event, turn_anchor: Option<&str>) -> Option<String> {
+    event
+        .parent_id()
+        .or(turn_anchor.filter(|anchor| *anchor == event.id))
+        .map(str::to_string)
+}
+
 pub fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -191,6 +214,58 @@ mod tests {
             block(ID_A, "@mage gen x")
         );
         assert_eq!(parse_turn(&text).reply_to.as_deref(), Some(ID_B));
+    }
+
+    fn event(id: &str, tags: &[&[&str]]) -> Event {
+        Event {
+            id: id.to_string(),
+            channel: CH.to_string(),
+            content: String::new(),
+            tags: tags
+                .iter()
+                .map(|tag| tag.iter().map(|part| part.to_string()).collect())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn each_event_in_a_batch_is_answered_in_its_own_thread() {
+        let root = "c".repeat(64);
+        let in_thread = event(
+            ID_A,
+            &[
+                &["e", &root, "", "root"],
+                &["e", ID_B, "", "reply"],
+                &["h", CH],
+            ],
+        );
+        let top_level = event(ID_B, &[&["h", CH]]);
+        let other_anchor = Some(root.as_str());
+        assert_eq!(
+            reply_anchor_for(&in_thread, other_anchor).as_deref(),
+            Some(ID_B)
+        );
+        assert_eq!(reply_anchor_for(&top_level, other_anchor), None);
+        assert_eq!(reply_anchor_for(&top_level, None), None);
+    }
+
+    #[test]
+    fn top_level_event_threads_under_itself_when_the_turn_says_so() {
+        let top_level = event(ID_A, &[&["h", CH]]);
+        assert_eq!(
+            reply_anchor_for(&top_level, Some(ID_A)).as_deref(),
+            Some(ID_A)
+        );
+    }
+
+    #[test]
+    fn root_marker_alone_or_malformed_ids_are_not_a_parent() {
+        let root_only = event(ID_A, &[&["e", ID_B, "", "root"]]);
+        let short_id = event(ID_A, &[&["e", "abc", "", "reply"]]);
+        let unmarked = event(ID_A, &[&["e", ID_B]]);
+        assert_eq!(root_only.parent_id(), None);
+        assert_eq!(short_id.parent_id(), None);
+        assert_eq!(unmarked.parent_id(), None);
     }
 
     #[test]

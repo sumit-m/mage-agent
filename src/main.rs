@@ -148,7 +148,7 @@ impl Agent {
             .into_iter()
             .map(|event| {
                 let config = self.config.clone();
-                let reply_to = turn.reply_to.clone();
+                let reply_to = prompt::reply_anchor_for(&event, turn.reply_to.as_deref());
                 std::thread::spawn(move || job::run(&config, &event, reply_to.as_deref()))
             })
             .collect();
