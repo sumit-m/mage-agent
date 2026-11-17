@@ -44,16 +44,88 @@ if (-not (Test-Path (Join-Path $InstallDir 'mage.exe'))) {
 $appId = if ($App -eq 'dev') { 'xyz.block.buzz.app.dev' } else { 'xyz.block.buzz.app' }
 $harnessDir = Join-Path $env:APPDATA "$appId\custom_harnesses"
 New-Item -ItemType Directory -Force $harnessDir | Out-Null
+# Buzz's message-box panel. Values travel by control id; mage-agent maps them
+# to mage flags. Presets come from the installed presets.ini.
+function Read-Presets([string]$path) {
+    $presets = [ordered]@{}
+    $current = $null
+    if (-not (Test-Path $path)) { return $presets }
+    foreach ($line in Get-Content $path) {
+        $line = $line.Trim()
+        if ($line -match '^\[(.+)\]$') {
+            $current = $Matches[1].Trim()
+            $presets[$current] = @{}
+        } elseif ($current -and $line -match '^([a-z_]+)\s*=\s*(.*)$') {
+            $presets[$current][$Matches[1]] = $Matches[2].Trim()
+        }
+    }
+    return $presets
+}
+$presetOptions = @()
+$presets = Read-Presets (Join-Path $InstallDir 'presets.ini')
+foreach ($name in $presets.Keys) {
+    $values = $presets[$name]
+    $sets = [ordered]@{}
+    if ($values['model_id']) { $sets['model'] = $values['model_id'] }
+    if ($values['aspect_ratio']) { $sets['aspect'] = $values['aspect_ratio'] }
+    if ($values['resolution']) { $sets['res'] = $values['resolution'] }
+    $presetOptions += [ordered]@{ value = $name; label = $name; sets = $sets }
+}
+$controls = @(
+    [ordered]@{
+        id = 'model'; kind = 'list'; label = 'Model'; icon = 'sparkles'; default = 'mango-v4'; sidecarKey = 'model_id'
+        options = @(
+            [ordered]@{ value = 'mango-v4'; label = 'Mango 4' },
+            [ordered]@{ value = 'mango-v3-pro'; label = 'Mango 3' },
+            [ordered]@{ value = 'mango-v2'; label = 'Mango 2' })
+    },
+    [ordered]@{
+        id = 'aspect'; kind = 'shapes'; label = 'Aspect ratio'; default = 'portrait'; sidecarKey = 'aspect_ratio'
+        defaultByMode = @{ edit = 'auto' }
+        options = @(
+            [ordered]@{ value = 'auto'; label = 'Auto'; modes = @('edit') },
+            [ordered]@{ value = 'portrait'; label = 'Portrait'; size = @(896, 1152) },
+            [ordered]@{ value = 'landscape'; label = 'Landscape'; size = @(1216, 832) },
+            [ordered]@{ value = 'square'; label = 'Square'; size = @(1024, 1024) },
+            [ordered]@{ value = 'cinema'; label = 'Cinema'; size = @(1344, 768) },
+            [ordered]@{ value = 'computer'; label = 'Computer'; size = @(1152, 896) })
+    },
+    [ordered]@{
+        id = 'res'; kind = 'segmented'; label = 'Resolution'; default = '1K'; sidecarKey = 'resolution'
+        defaultByMode = @{ edit = 'auto' }
+        options = @(
+            [ordered]@{ value = 'auto'; label = 'Auto'; modes = @('edit') },
+            [ordered]@{ value = '1K'; label = '1K'; scale = 1 },
+            [ordered]@{ value = '2K'; label = '2K'; scale = 2 })
+    }
+)
+if ($presetOptions.Count -gt 0) {
+    $controls += [ordered]@{ id = 'preset'; kind = 'preset'; label = 'Preset'; icon = 'wand'; options = $presetOptions }
+}
+$controls += [ordered]@{
+    id = 'repo'; kind = 'repoFolder'; label = 'Save to repository'; icon = 'git-branch'; defaultFolder = 'assets/'; options = @()
+}
+
+$harnessFile = Join-Path $harnessDir 'mage.json'
 $definition = [ordered]@{
     id          = 'mage'
     label       = 'Mage'
     command     = (Join-Path $InstallDir 'mage-agent.exe')
     args        = @()
-    env         = @{}
+    # mage-agent rebuilds the Preset menu here from presets.ini when it starts.
+    env         = @{ MAGE_HARNESS_FILE = $harnessFile }
     installHint = 'Run install.ps1 from the mage-agent repository.'
+    composer    = [ordered]@{
+        modes    = @(
+            [ordered]@{ id = 'generate'; label = 'Generate' },
+            [ordered]@{ id = 'edit'; label = 'Edit'; requiresImage = $true; autoOnImage = $true })
+        controls = $controls
+        # Buzz runs `mage-agent --refresh-presets` before each read of the
+        # panel, which rebuilds the Preset menu from presets.ini.
+        refresh  = @('--refresh-presets')
+    }
 }
-$json = $definition | ConvertTo-Json
-$harnessFile = Join-Path $harnessDir 'mage.json'
+$json = $definition | ConvertTo-Json -Depth 10
 [System.IO.File]::WriteAllText($harnessFile, $json, (New-Object System.Text.UTF8Encoding $false))
 
 Write-Host "Installed $InstallDir\mage-agent.exe"

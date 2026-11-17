@@ -17,6 +17,9 @@ commit the image and its `.json` sidecar to a repository bound to the channel.
 - Every mage command and flag passes through unchanged, except `--output`, which
   mage-agent sets to a temp directory.
 - `edit` without `--src` uses the first image attached to the same message.
+- `<repo>` may be `<owner-hex>/<repo>`. A repo bound to the request's channel is
+  used as is; one named that way from elsewhere (a DM) is used only when the
+  requester owns it or is a member of the channel it's bound to.
 - `--src <repo>:<path>` takes the file from the default branch of a repository
   bound to the channel (by id or name). Drive paths such as `C:\…` stay local.
 - `--repo <path>` uses the channel's only bound repository; `--repo <repo>:<path>`
@@ -26,11 +29,34 @@ commit the image and its `.json` sidecar to a repository bound to the channel.
 - Commits go straight to the repository's default branch, using the agent's Git
   identity from the harness. A protected branch rejects the push and the reply
   says so; the image is still posted.
+- The commit message is mage's reply without its `url:` line (the CDN link
+  expires after 30 days), on one line: `model: …, 10s, history_id: …`.
+- With an image, the reply (channel or DM) is only the saved location (if any)
+  and notes, then the image: Buzz Desktop hides the attached sidecar's file card
+  and shows its prompt, model, size, time and history id in a sidebar beside
+  the image. Other clients still see the `.json` as a file. Without an image,
+  the reply is mage's output.
+- Buzz's message-box panel (Generate/Edit, model, aspect, resolution, preset,
+  repo folder) sends the prompt as the message text and its settings in a hidden
+  `buzz-composer` tag. mage-agent passes every setting to mage explicitly; only
+  Edit's Auto aspect and resolution leave the flag out. `@name` words in the
+  prompt are kept for mage. `install.ps1` writes the panel into `mage.json`,
+  with presets read from `presets.ini`. Each control's `sidecarKey` names the
+  sidecar field it comes from, so Edit on a chat image starts from its settings.
+- The Preset menu follows `presets.ini` live: the panel's `refresh` entry makes
+  Buzz run `mage-agent --refresh-presets` (with `BUZZ_HARNESS_FILE` naming
+  `mage.json`) before each read of the panel, on every `@mage` and at most
+  once a minute. mage-agent also refreshes when it starts as an agent. Presets
+  whose names have spaces or quotes are left out, since Buzz would reject the
+  whole panel.
 - Overlapping requests each run the CLI, which queues them and runs one at a time.
 - Repositories are reached through a temporary blobless clone (`--depth 1
   --filter=blob:none`) deleted with the job: a save uploads only the new files
   and `--src` fetches only that file. A relay that doesn't serve partial clones
   sends every file of the latest commit instead.
+- Each job works in `%TEMP%\mage-agent\<message id>`, deleted once the reply is
+  posted. A folder left by an agent stopped mid-job is removed the next time
+  mage-agent starts, once it's more than a day old.
 
 ## Install
 

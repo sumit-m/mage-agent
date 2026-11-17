@@ -3,14 +3,49 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::command;
 use crate::prompt::Event;
+use crate::{command, composer};
 use crate::{proc, repo, strip, terminal};
 
 /// Includes time spent waiting in mage's queue; stays under buzz-acp's 2-hour turn cap.
 const MAGE_TIMEOUT: Duration = Duration::from_secs(100 * 60);
 const BUZZ_TIMEOUT: Duration = Duration::from_secs(180);
 const IMAGE_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "png", "webp", "gif"];
+/// Far longer than any job (see `MAGE_TIMEOUT`), so a folder this old was
+/// left by an agent stopped mid-job, not one still running elsewhere.
+const STALE_WORK_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Removes job folders under `work_root` last changed more than `max_age`
+/// ago. Returns how many were removed.
+pub fn sweep_stale_work(work_root: &Path, max_age: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(work_root) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| {
+            entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > max_age)
+        })
+        .filter(|entry| std::fs::remove_dir_all(entry.path()).is_ok())
+        .count()
+}
+
+/// [`sweep_stale_work`] with the standard age, logging what it removed.
+pub fn sweep_stale(work_root: &Path) {
+    let removed = sweep_stale_work(work_root, STALE_WORK_AGE);
+    if removed > 0 {
+        eprintln!(
+            "mage-agent: removed {removed} leftover job folder(s) from {}",
+            work_root.display()
+        );
+    }
+}
 
 pub struct Config {
     pub mage: PathBuf,
@@ -55,15 +90,28 @@ impl Reply {
 fn handle(config: &Config, event: &Event, work: &Path) -> Reply {
     let attachments = attachments(&event.tags);
     let urls: Vec<String> = attachments.iter().map(|a| a.url.clone()).collect();
-    let mut request =
-        match command::parse_request(&event.content, &urls, config.display_name.as_deref()) {
-            Ok(request) => request,
-            Err(message) => return Reply::text(message),
-        };
+    let display_name = config.display_name.as_deref();
+    let parsed = match composer::payload(&event.tags) {
+        Some(json) => composer::request(&event.content, &urls, display_name, json),
+        None => command::parse_request(&event.content, &urls, display_name),
+    };
+    let mut request = match parsed {
+        Ok(request) => request,
+        Err(message) => return Reply::text(message),
+    };
 
     let mut args = request.args.clone();
+    let mut ignored_images = 0;
     if request.subcommand() == "edit" && !request.has_flag("--src") {
-        if let Some(image) = attachments.iter().find(|a| a.mime.starts_with("image/")) {
+        let images: Vec<&Attachment> = attachments
+            .iter()
+            .filter(|a| a.mime.starts_with("image/"))
+            .collect();
+        if images.is_empty() {
+            return Reply::text("Attach an image to edit.".into());
+        }
+        ignored_images = images.len() - 1;
+        if let Some(image) = images.first() {
             match download(config, image, work) {
                 Ok(path) => {
                     args.push("--src".into());
@@ -96,16 +144,23 @@ fn handle(config: &Config, event: &Event, work: &Path) -> Reply {
         Err(e) => return Reply::text(format!("Could not start `{}`: {e}", config.mage.display())),
     };
 
-    let mut content = without_lines_mentioning(&terminal::clean(&output.combined()), work);
+    let printed = without_lines_mentioning(&terminal::clean(&output.combined()), work);
+    let mut notes = Vec::new();
     if output.timed_out {
-        content.push_str(&format!(
-            "\nStopped waiting after {} minutes; mage may still finish the job.",
+        notes.push(format!(
+            "Stopped waiting after {} minutes; mage may still finish the job.",
             MAGE_TIMEOUT.as_secs() / 60
         ));
     } else if !output.success {
-        content.push_str(&format!(
-            "\nmage exited with code {}.",
+        notes.push(format!(
+            "mage exited with code {}.",
             output.code.unwrap_or(-1)
+        ));
+    }
+    if ignored_images > 0 {
+        let plural = if ignored_images == 1 { "" } else { "s" };
+        notes.push(format!(
+            "Edited the first attached image; {ignored_images} other image{plural} ignored."
         ));
     }
 
@@ -115,19 +170,54 @@ fn handle(config: &Config, event: &Event, work: &Path) -> Reply {
 
     if images.is_empty() {
         if output.success && request.produces_images() {
-            content.push_str("\nmage reported success but wrote no image.");
+            notes.push("mage reported success but wrote no image.".into());
         }
-    } else if let Some(spec) = request.repo.take() {
-        content.push('\n');
-        content.push_str(&save_to_repo(
-            config, event, work, &spec, &images, &sidecars,
-        ));
+        let content = std::iter::once(printed.trim().to_string())
+            .chain(notes)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = if content.is_empty() {
+            "mage finished without output.".to_string()
+        } else {
+            content
+        };
+        return Reply { content, files };
     }
-    let mut content = content.trim().to_string();
-    if content.is_empty() {
-        content = "mage finished without output.".into();
+
+    // With an image, Buzz Desktop shows its prompt, model, size, time and
+    // history id in a sidebar built from the sidecar, so the reply carries only
+    // the saved location and any notes. The commit message, which has no
+    // sidebar, is still built from mage's output.
+    if let Some(spec) = request.repo.take() {
+        let message = commit_message(&printed, &event.content);
+        notes.insert(
+            0,
+            save_to_repo(config, event, work, &spec, &images, &sidecars, &message),
+        );
     }
-    Reply { content, files }
+    Reply {
+        content: notes.join("\n"),
+        files,
+    }
+}
+
+/// The commit message is the channel reply without its `url:` line (the CDN
+/// link expires after 30 days, while the commit lasts), as one line with its
+/// lines separated by commas. Falls back to the request text when mage printed
+/// nothing else.
+fn commit_message(reply: &str, request: &str) -> String {
+    let kept: Vec<&str> = reply
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.to_ascii_lowercase().starts_with("url:"))
+        .collect();
+    let message = kept.join(", ");
+    if message.is_empty() {
+        command::strip_formatting(request).trim().to_string()
+    } else {
+        message
+    }
 }
 
 fn save_to_repo(
@@ -137,18 +227,10 @@ fn save_to_repo(
     spec: &str,
     images: &[PathBuf],
     sidecars: &[PathBuf],
+    message: &str,
 ) -> String {
-    let result = repo::list_channel_repos(&config.buzz, &event.channel)
-        .and_then(|repos| repo::resolve_target(spec, &repos))
-        .and_then(|target| {
-            repo::save(
-                work,
-                &target,
-                images,
-                sidecars,
-                &command::strip_formatting(&event.content),
-            )
-        });
+    let result = repo::resolve_for(&config.buzz, &event.channel, &event.sender, spec)
+        .and_then(|target| repo::save(work, &target, images, sidecars, message));
     match result {
         Ok(saved) => format!(
             "Saved to `{}` @ `{}`: {}",
@@ -178,8 +260,7 @@ fn localize_repo_src(
     if !is_repo_ref(&value) {
         return Ok(());
     }
-    let repos = repo::list_channel_repos(&config.buzz, &event.channel)?;
-    let target = repo::resolve_target(&value, &repos)?;
+    let target = repo::resolve_for(&config.buzz, &event.channel, &event.sender, &value)?;
     let dest_dir = work.join("src");
     std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
     let local = repo::fetch_file(work, &target, &dest_dir)?;
@@ -299,8 +380,24 @@ fn attachable(images: &[PathBuf], work: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// `messages send --file` appends `\n![name](url)` per file, so a trailing
+/// newline puts the attachments in their own paragraph, a paragraph gap below
+/// the text. With no text, the attachments start the message.
+fn with_attachment_gap(content: &str, has_files: bool) -> String {
+    if !has_files {
+        return content.to_string();
+    }
+    let text = content.trim_end();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("{text}\n")
+    }
+}
+
 fn post(config: &Config, channel: &str, reply_to: Option<&str>, reply: Reply) {
     let send = |content: &str, files: &[PathBuf]| {
+        let content = with_attachment_gap(content, !files.is_empty());
         let mut cmd = proc::command(&config.buzz);
         cmd.args(["messages", "send", "--channel", channel, "--content", "-"]);
         if let Some(id) = reply_to {
@@ -309,7 +406,7 @@ fn post(config: &Config, channel: &str, reply_to: Option<&str>, reply: Reply) {
         for file in files {
             cmd.arg("--file").arg(file);
         }
-        proc::run(cmd, Some(content), BUZZ_TIMEOUT)
+        proc::run(cmd, Some(&content), BUZZ_TIMEOUT)
             .map_err(|e| e.to_string())
             .and_then(|out| {
                 if out.success {
@@ -375,6 +472,45 @@ mod tests {
             Some((1, "--src=", "site:a.jpg".to_string()))
         );
         assert_eq!(src_value(&args(&["edit", "x"])), None);
+    }
+
+    #[test]
+    fn commit_message_is_the_reply_without_the_url_line() {
+        let reply = "model: mango-v4, portrait, 1K (896x1152), 21s\n\
+                     history_id: f2eb17ef\n\
+                     url: https://cdn3.mage.space/x.jpg (expires Dec 15, 2026)\n\
+                     Edited the first attached image; 1 other image ignored.";
+        assert_eq!(
+            commit_message(reply, "@Mage a dragon"),
+            "model: mango-v4, portrait, 1K (896x1152), 21s, history_id: f2eb17ef, \
+             Edited the first attached image; 1 other image ignored."
+        );
+        assert_eq!(
+            commit_message("url: https://x\n", "@Mage **a** dragon"),
+            "@Mage a dragon"
+        );
+    }
+
+    #[test]
+    fn sweep_removes_only_job_folders_past_the_age() {
+        let root = std::env::temp_dir().join(format!("mage-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("aaaa/out")).unwrap();
+        std::fs::create_dir_all(root.join("bbbb")).unwrap();
+        std::fs::write(root.join("note.txt"), "x").unwrap();
+        assert_eq!(sweep_stale_work(&root, Duration::from_secs(3600)), 0);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(sweep_stale_work(&root, Duration::ZERO), 2);
+        assert!(root.join("note.txt").is_file());
+        assert!(!root.join("aaaa").exists());
+        assert_eq!(sweep_stale_work(&root.join("missing"), Duration::ZERO), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn attachments_get_their_own_paragraph() {
+        assert_eq!(with_attachment_gap("Saved to x\n\n", true), "Saved to x\n");
+        assert_eq!(with_attachment_gap(" \n", true), "");
+        assert_eq!(with_attachment_gap("no image", false), "no image");
     }
 
     #[test]

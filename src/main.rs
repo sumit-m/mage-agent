@@ -9,7 +9,9 @@
 //! queue.
 
 mod command;
+mod composer;
 mod job;
+mod presets;
 mod proc;
 mod prompt;
 mod repo;
@@ -263,14 +265,67 @@ fn config() -> job::Config {
     }
 }
 
+/// Brings Buzz's Preset menu in line with the `presets.ini` beside mage.
+/// Returns false when it couldn't.
+fn refresh_presets(config: &job::Config) -> bool {
+    // Buzz names the file when it runs `--refresh-presets` before reading its
+    // panels. An agent gets the harness file's env only after Buzz reloads its
+    // harness list, so also look for the file naming this exe as its command.
+    let Some(harness_file) = env_path("BUZZ_HARNESS_FILE")
+        .or_else(|| env_path("MAGE_HARNESS_FILE"))
+        .or_else(|| {
+            let exe = std::env::current_exe().ok()?;
+            let app_data = env_path("APPDATA")?;
+            let dirs = ["xyz.block.buzz.app.dev", "xyz.block.buzz.app"]
+                .map(|app| app_data.join(app).join("custom_harnesses"));
+            presets::harness_file_for(&dirs, &exe)
+        })
+    else {
+        return true;
+    };
+    // mage found only on PATH (no install folder) has no presets.ini we can
+    // place, so the panel is left as it is rather than read from Buzz's cwd.
+    let Some(mage_dir) = config
+        .mage
+        .parent()
+        .filter(|dir| dir.is_absolute() && dir.is_dir())
+    else {
+        return true;
+    };
+    let presets_ini = mage_dir.join("presets.ini");
+    match presets::refresh(&harness_file, &presets_ini) {
+        Ok(true) => {
+            eprintln!(
+                "mage-agent: presets refreshed from {}",
+                presets_ini.display()
+            );
+            true
+        }
+        Ok(false) => true,
+        Err(e) => {
+            eprintln!("mage-agent: presets not refreshed: {e}");
+            false
+        }
+    }
+}
+
 fn main() {
     let config = config();
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--refresh-presets")
+    {
+        std::process::exit(if refresh_presets(&config) { 0 } else { 1 });
+    }
     eprintln!(
         "mage-agent {}: mage={} buzz={}",
         env!("CARGO_PKG_VERSION"),
         config.mage.display(),
         config.buzz.display()
     );
+    refresh_presets(&config);
+    let work_root = config.work_root.clone();
+    std::thread::spawn(move || job::sweep_stale(&work_root));
     let agent = Arc::new(Agent {
         config: Arc::new(config),
         stdout: Mutex::new(std::io::stdout()),

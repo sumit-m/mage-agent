@@ -71,7 +71,7 @@ pub fn parse_request(
     Ok(request)
 }
 
-fn without_attachment_lines(content: &str, attachment_urls: &[String]) -> String {
+pub(crate) fn without_attachment_lines(content: &str, attachment_urls: &[String]) -> String {
     content
         .lines()
         .filter(|line| {
@@ -149,7 +149,7 @@ fn normalize_typography(text: &str) -> String {
         .join(" ")
 }
 
-fn strip_display_name<'a>(text: &'a str, display_name: Option<&str>) -> &'a str {
+pub(crate) fn strip_display_name<'a>(text: &'a str, display_name: Option<&str>) -> &'a str {
     let Some(name) = display_name.map(str::trim).filter(|n| !n.is_empty()) else {
         return text;
     };

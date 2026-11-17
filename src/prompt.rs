@@ -8,6 +8,8 @@
 pub struct Event {
     pub id: String,
     pub channel: String,
+    /// The signer's hex pubkey, from the `From:` line.
+    pub sender: String,
     pub content: String,
     pub tags: Vec<Vec<String>>,
 }
@@ -86,6 +88,13 @@ pub fn channel_uuid(display: &str) -> Option<String> {
     is_uuid(candidate).then(|| candidate.to_string())
 }
 
+/// `From:` renders as `<label> (npub: <npub>, hex: <hex>)` or `<npub> (hex: <hex>)`.
+fn sender_hex(display: &str) -> Option<String> {
+    let start = display.rfind("hex: ")? + "hex: ".len();
+    let hex = display.get(start..start + 64)?;
+    is_hex64(hex).then(|| hex.to_ascii_lowercase())
+}
+
 fn section_body<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     let open = format!("<{tag}>\n");
     let close = format!("\n</{tag}>");
@@ -148,7 +157,7 @@ fn parse_event_block(block: &str) -> Option<(Event, usize)> {
     let id = lines.next()?.strip_prefix("Event ID: ")?.trim().to_string();
     let channel = channel_uuid(lines.next()?.strip_prefix("Channel: ")?)?;
     lines.next()?.strip_prefix("Kind: ")?;
-    lines.next()?.strip_prefix("From: ")?;
+    let sender = sender_hex(lines.next()?.strip_prefix("From: ")?)?;
     lines.next()?.strip_prefix("Time: ")?;
     let tail = lines.next()?.strip_prefix("Content: ")?;
     let tail_offset = block.len() - tail.len();
@@ -163,6 +172,7 @@ fn parse_event_block(block: &str) -> Option<(Event, usize)> {
             let event = Event {
                 id,
                 channel,
+                sender,
                 content: tail[..cursor + found].to_string(),
                 tags,
             };
@@ -180,10 +190,11 @@ mod tests {
     const ID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const ID_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const CH: &str = "0f8b2c9e-1d2a-4b3c-9d4e-5f6a7b8c9d0e";
+    const SENDER: &str = "abababababababababababababababababababababababababababababababab";
 
     fn block(id: &str, content: &str) -> String {
         format!(
-            "Event ID: {id}\nChannel: art (#{CH})\nKind: 9\nFrom: Alex (npub: npub1x, hex: ab)\n\
+            "Event ID: {id}\nChannel: art (#{CH})\nKind: 9\nFrom: Alex (npub: npub1x, hex: {SENDER})\n\
              Time: 2026-11-15T10:00:00+00:00\nContent: {content}\n\
              Tags: [[\"h\",\"{CH}\"],[\"p\",\"cc\"]]\nParsed: mentions=[mage]"
         )
@@ -202,8 +213,23 @@ mod tests {
         let event = &turn.events[0];
         assert_eq!(event.id, ID_A);
         assert_eq!(event.channel, CH);
+        assert_eq!(event.sender, SENDER);
         assert_eq!(event.content, "@mage gen a cat\nsecond line");
         assert_eq!(event.tags[0], vec!["h".to_string(), CH.to_string()]);
+    }
+
+    #[test]
+    fn sender_comes_from_either_from_form() {
+        let hex = SENDER.to_uppercase();
+        assert_eq!(
+            sender_hex(&format!("Alex (npub: npub1x, hex: {hex})")).as_deref(),
+            Some(SENDER)
+        );
+        assert_eq!(
+            sender_hex(&format!("npub1x (hex: {SENDER})")).as_deref(),
+            Some(SENDER)
+        );
+        assert_eq!(sender_hex("npub1x (hex: ab)"), None);
     }
 
     #[test]
@@ -220,6 +246,7 @@ mod tests {
         Event {
             id: id.to_string(),
             channel: CH.to_string(),
+            sender: SENDER.to_string(),
             content: String::new(),
             tags: tags
                 .iter()

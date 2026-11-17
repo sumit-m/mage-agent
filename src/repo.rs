@@ -1,5 +1,7 @@
 //! `--repo [<repo>:]<path>` and `--src <repo>:<path>`: Buzz repositories bound
-//! to the channel, reached through a temporary blobless clone in the job's work
+//! to the channel, or named as `<owner-hex>/<repo>` from anywhere (a DM, say)
+//! by someone who owns it or belongs to its bound channel. Each is reached
+//! through a temporary blobless clone in the job's work
 //! folder. It holds the latest commit and its folder listings but no file
 //! contents, so saving uploads only the new files and reading fetches only the
 //! one file asked for. A relay without partial-clone support sends every file
@@ -20,6 +22,16 @@ pub struct RepoInfo {
     pub name: Option<String>,
     pub clone: Option<String>,
     pub branch: String,
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// The channel the repository is bound to.
+    #[serde(default)]
+    pub channel: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Member {
+    pubkey: String,
 }
 
 impl RepoInfo {
@@ -28,12 +40,25 @@ impl RepoInfo {
     }
 
     fn matches(&self, wanted: &str) -> bool {
+        if let Some((owner, id)) = owner_and_id(wanted) {
+            return self.id == id
+                && self
+                    .owner
+                    .as_deref()
+                    .is_some_and(|o| o.eq_ignore_ascii_case(owner));
+        }
         self.id == wanted
             || self
                 .name
                 .as_deref()
                 .is_some_and(|n| n.eq_ignore_ascii_case(wanted))
     }
+}
+
+/// `<owner-hex>/<repo>` split into its parts.
+fn owner_and_id(wanted: &str) -> Option<(&str, &str)> {
+    let (owner, id) = wanted.split_once('/')?;
+    (crate::prompt::is_hex64(owner) && !id.is_empty()).then_some((owner, id))
 }
 
 #[derive(Debug)]
@@ -56,6 +81,93 @@ pub fn list_channel_repos(buzz: &Path, channel: &str) -> Result<Vec<RepoInfo>, S
         return Err(format!("`buzz repos list` failed: {}", out.failure_text()));
     }
     serde_json::from_str(out.stdout.trim()).map_err(|e| format!("unreadable repo list: {e}"))
+}
+
+fn list_owner_repos(buzz: &Path, owner: &str) -> Result<Vec<RepoInfo>, String> {
+    let mut cmd = proc::command(buzz);
+    cmd.args(["--format", "compact", "repos", "list", "--owner", owner]);
+    let out = proc::run(cmd, None, Duration::from_secs(60)).map_err(|e| e.to_string())?;
+    if !out.success {
+        return Err(format!("`buzz repos list` failed: {}", out.failure_text()));
+    }
+    serde_json::from_str(out.stdout.trim()).map_err(|e| format!("unreadable repo list: {e}"))
+}
+
+fn channel_members(buzz: &Path, channel: &str) -> Result<Vec<String>, String> {
+    let mut cmd = proc::command(buzz);
+    cmd.args([
+        "--format",
+        "compact",
+        "channels",
+        "members",
+        "--channel",
+        channel,
+    ]);
+    let out = proc::run(cmd, None, Duration::from_secs(60)).map_err(|e| e.to_string())?;
+    if !out.success {
+        return Err(format!(
+            "`buzz channels members` failed: {}",
+            out.failure_text()
+        ));
+    }
+    let members: Vec<Member> = serde_json::from_str(out.stdout.trim())
+        .map_err(|e| format!("unreadable member list: {e}"))?;
+    Ok(members.into_iter().map(|m| m.pubkey).collect())
+}
+
+/// The repository `spec` names for a request from `sender` in `channel`: one
+/// bound to that channel, else one named `<owner-hex>/<repo>` that `sender`
+/// owns or whose bound channel `sender` belongs to. The relay still decides
+/// whether mage itself may push there.
+pub fn resolve_for(buzz: &Path, channel: &str, sender: &str, spec: &str) -> Result<Target, String> {
+    let repos = list_channel_repos(buzz, channel)?;
+    let not_here = match resolve_target(spec, &repos) {
+        Ok(target) => return Ok(target),
+        Err(e) => e,
+    };
+    let Some((owner, id, path)) = spec
+        .split_once(':')
+        .and_then(|(wanted, path)| owner_and_id(wanted).map(|(o, i)| (o, i, path)))
+    else {
+        return Err(not_here);
+    };
+    let repo = list_owner_repos(buzz, owner)?
+        .into_iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| format!("no repository `{id}` from that owner"))?;
+    let members = match &repo.channel {
+        Some(bound) if !sender.eq_ignore_ascii_case(owner) => channel_members(buzz, bound)?,
+        _ => Vec::new(),
+    };
+    authorize_unbound(&repo, owner, sender, &members)?;
+    Ok(Target {
+        repo,
+        path: validate_path(path)?,
+    })
+}
+
+/// A repository from outside the request's channel is open to its owner and
+/// to members of the channel it's bound to.
+fn authorize_unbound(
+    repo: &RepoInfo,
+    owner: &str,
+    sender: &str,
+    members: &[String],
+) -> Result<(), String> {
+    if sender.eq_ignore_ascii_case(owner) {
+        return Ok(());
+    }
+    if repo.channel.is_none() {
+        return Err(format!("`{}` isn't bound to a channel", repo.label()));
+    }
+    if members.iter().any(|m| m.eq_ignore_ascii_case(sender)) {
+        Ok(())
+    } else {
+        Err(format!(
+            "only members of `{}`'s channel can save to it",
+            repo.label()
+        ))
+    }
 }
 
 pub fn resolve_target(spec: &str, repos: &[RepoInfo]) -> Result<Target, String> {
@@ -341,7 +453,35 @@ mod tests {
             name: Some(name.into()),
             clone: Some(format!("https://relay/git/x/{id}")),
             branch: "main".into(),
+            owner: Some(OWNER.into()),
+            channel: Some("ch-1".into()),
         }
+    }
+
+    const OWNER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const OTHER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    #[test]
+    fn owner_qualified_name_matches_id_and_owner() {
+        let two = [repo("site", "Site"), repo("art", "Art")];
+        let spec = format!("{OWNER}/art:img/");
+        assert_eq!(resolve_target(&spec, &two).unwrap().repo.id, "art");
+        assert!(resolve_target(&format!("{OTHER}/art:img/"), &two).is_err());
+        assert!(resolve_target(&format!("{OWNER}/Art:img/"), &two).is_err());
+    }
+
+    #[test]
+    fn unbound_repo_is_for_its_owner_and_its_channel_members() {
+        let art = repo("art", "Art");
+        assert!(authorize_unbound(&art, OWNER, OWNER, &[]).is_ok());
+        assert!(authorize_unbound(&art, OWNER, OTHER, &[OTHER.to_uppercase()]).is_ok());
+        let err = authorize_unbound(&art, OWNER, OTHER, &[OWNER.into()]).unwrap_err();
+        assert!(err.contains("only members of `Art`"));
+        let unbound = RepoInfo {
+            channel: None,
+            ..repo("art", "Art")
+        };
+        assert!(authorize_unbound(&unbound, OWNER, OTHER, &[OTHER.into()]).is_err());
     }
 
     #[test]
@@ -444,6 +584,8 @@ mod tests {
             name: Some("Art".into()),
             clone: Some(url),
             branch: "main".into(),
+            owner: None,
+            channel: None,
         }
     }
 
