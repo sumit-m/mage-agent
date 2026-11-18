@@ -75,8 +75,8 @@ pub fn preset_control(presets: &[(String, Vec<(String, String)>)]) -> Option<Val
     })
 }
 
-/// Puts `control` in place of the panel's Preset control (before the repo
-/// picker when there was none), or removes it when `control` is `None`.
+/// Puts `control` in place of the panel's Preset control (before the asset
+/// menus and repo picker when there was none), or removes it when `control` is `None`.
 /// Returns whether anything changed.
 fn replace_preset(controls: &mut Vec<Value>, control: Option<Value>) -> bool {
     let existing = controls.iter().position(|c| c["kind"] == "preset");
@@ -93,7 +93,7 @@ fn replace_preset(controls: &mut Vec<Value>, control: Option<Value>) -> bool {
         (None, Some(control)) => {
             let at = controls
                 .iter()
-                .position(|c| c["kind"] == "repoFolder")
+                .position(|c| c["kind"] == "assets" || c["kind"] == "repoFolder")
                 .unwrap_or(controls.len());
             controls.insert(at, control);
             true
@@ -154,6 +154,17 @@ pub fn refresh(harness_file: &Path, presets_ini: &Path) -> Result<bool, String> 
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("{}: {e}", presets_ini.display())),
     };
+    update_controls(harness_file, |controls| {
+        replace_preset(controls, preset_control(&parse(&text)))
+    })
+}
+
+/// Applies `change` to the harness file's panel controls and writes the file
+/// back when it reports a change. Returns whether the file changed.
+pub fn update_controls(
+    harness_file: &Path,
+    change: impl FnOnce(&mut Vec<Value>) -> bool,
+) -> Result<bool, String> {
     let raw = std::fs::read_to_string(harness_file)
         .map_err(|e| format!("{}: {e}", harness_file.display()))?;
     let mut harness: Value = serde_json::from_str(raw.trim_start_matches('\u{feff}'))
@@ -164,7 +175,7 @@ pub fn refresh(harness_file: &Path, presets_ini: &Path) -> Result<bool, String> 
     else {
         return Ok(false);
     };
-    if !replace_preset(controls, preset_control(&parse(&text))) {
+    if !change(controls) {
         return Ok(false);
     }
     let out = serde_json::to_string_pretty(&harness).map_err(|e| e.to_string())?;

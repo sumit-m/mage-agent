@@ -49,6 +49,13 @@ commit the image and its `.json` sidecar to a repository bound to the channel.
   once a minute. mage-agent also refreshes when it starts as an agent. Presets
   whose names have spaces or quotes are left out, since Buzz would reject the
   whole panel.
+- The panel's Character and Reference menus list your mage assets (`mage
+  assets --json`, written into `mage.json` by `mage-agent --refresh-assets`,
+  which Buzz runs each time a menu opens and once per mention when you type
+  `@`; `install.ps1` fills them once). A pick puts `@handle` in the prompt,
+  which mage resolves itself. Buzz shows known handles in bold yellow and
+  unknown ones in bold grey, with chips above the prompt, and lists the
+  assets an image's prompt names in its info sidebar.
 - Overlapping requests each run the CLI, which queues them and runs one at a time.
 - Repositories are reached through a temporary blobless clone (`--depth 1
   --filter=blob:none`) deleted with the job: a save uploads only the new files

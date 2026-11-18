@@ -102,6 +102,16 @@ $controls = @(
 if ($presetOptions.Count -gt 0) {
     $controls += [ordered]@{ id = 'preset'; kind = 'preset'; label = 'Preset'; icon = 'wand'; options = $presetOptions }
 }
+# Filled from `mage assets --json`: Buzz runs `mage-agent --refresh-assets`
+# when either menu opens. A pick puts `@handle` in the prompt.
+foreach ($menu in @(
+        @{ id = 'character'; label = 'Character'; title = 'Choose Your Character'; icon = 'user-plus' },
+        @{ id = 'reference'; label = 'Reference'; title = 'Choose Your Reference'; icon = 'shapes' })) {
+    $controls += [ordered]@{
+        id = $menu.id; kind = 'assets'; label = $menu.label; title = $menu.title; icon = $menu.icon
+        refresh = @('--refresh-assets'); options = @()
+    }
+}
 $controls += [ordered]@{
     id = 'repo'; kind = 'repoFolder'; label = 'Save to repository'; icon = 'git-branch'; defaultFolder = 'assets/'; options = @()
 }
@@ -127,6 +137,12 @@ $definition = [ordered]@{
 }
 $json = $definition | ConvertTo-Json -Depth 10
 [System.IO.File]::WriteAllText($harnessFile, $json, (New-Object System.Text.UTF8Encoding $false))
+
+$env:MAGE_HARNESS_FILE = $harnessFile
+& (Join-Path $InstallDir 'mage-agent.exe') --refresh-assets
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning 'Character and Reference menus are empty until mage can list your assets; they refresh when opened.'
+}
 
 Write-Host "Installed $InstallDir\mage-agent.exe"
 Write-Host "Registered $harnessFile"

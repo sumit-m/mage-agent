@@ -8,6 +8,7 @@
 //! since buzz-acp times out a silent turn and a job can wait a while in mage's
 //! queue.
 
+mod assets;
 mod command;
 mod composer;
 mod job;
@@ -31,6 +32,8 @@ use serde_json::{json, Value};
 const SEEN_CAPACITY: usize = 5000;
 /// Well inside buzz-acp's idle timeout (25 minutes by default).
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Inside Buzz's own limit for a menu refresh.
+const ASSETS_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct Agent {
     config: Arc<job::Config>,
@@ -267,11 +270,11 @@ fn config() -> job::Config {
 
 /// Brings Buzz's Preset menu in line with the `presets.ini` beside mage.
 /// Returns false when it couldn't.
-fn refresh_presets(config: &job::Config) -> bool {
-    // Buzz names the file when it runs `--refresh-presets` before reading its
-    // panels. An agent gets the harness file's env only after Buzz reloads its
-    // harness list, so also look for the file naming this exe as its command.
-    let Some(harness_file) = env_path("BUZZ_HARNESS_FILE")
+fn harness_file() -> Option<PathBuf> {
+    // Buzz names the file when it runs a refresh before reading its panels. An
+    // agent gets the harness file's env only after Buzz reloads its harness
+    // list, so also look for the file naming this exe as its command.
+    env_path("BUZZ_HARNESS_FILE")
         .or_else(|| env_path("MAGE_HARNESS_FILE"))
         .or_else(|| {
             let exe = std::env::current_exe().ok()?;
@@ -280,7 +283,34 @@ fn refresh_presets(config: &job::Config) -> bool {
                 .map(|app| app_data.join(app).join("custom_harnesses"));
             presets::harness_file_for(&dirs, &exe)
         })
-    else {
+}
+
+/// Fills Buzz's Character and Reference menus from `mage assets --json`.
+/// Returns false when it couldn't; the menus then keep what they had.
+fn refresh_assets(config: &job::Config) -> bool {
+    let Some(harness_file) = harness_file() else {
+        return true;
+    };
+    let mut cmd = proc::command(&config.mage);
+    cmd.args(["assets", "--json"]);
+    let assets = match proc::run(cmd, None, ASSETS_TIMEOUT) {
+        Ok(output) if output.success => assets::parse(&output.stdout),
+        Ok(output) => Err(output.failure_text()),
+        Err(e) => Err(format!("{}: {e}", config.mage.display())),
+    };
+    match assets.and_then(|assets| {
+        presets::update_controls(&harness_file, |controls| assets::apply(controls, &assets))
+    }) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("mage-agent: assets not refreshed: {e}");
+            false
+        }
+    }
+}
+
+fn refresh_presets(config: &job::Config) -> bool {
+    let Some(harness_file) = harness_file() else {
         return true;
     };
     // mage found only on PATH (no install folder) has no presets.ini we can
@@ -311,11 +341,13 @@ fn refresh_presets(config: &job::Config) -> bool {
 
 fn main() {
     let config = config();
-    if std::env::args()
-        .skip(1)
-        .any(|arg| arg == "--refresh-presets")
-    {
-        std::process::exit(if refresh_presets(&config) { 0 } else { 1 });
+    let refresh = std::env::args().skip(1).find_map(|arg| match arg.as_str() {
+        "--refresh-presets" => Some(refresh_presets as fn(&job::Config) -> bool),
+        "--refresh-assets" => Some(refresh_assets),
+        _ => None,
+    });
+    if let Some(refresh) = refresh {
+        std::process::exit(if refresh(&config) { 0 } else { 1 });
     }
     eprintln!(
         "mage-agent {}: mage={} buzz={}",
