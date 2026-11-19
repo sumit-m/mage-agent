@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde_json::{json, Value};
+
 use crate::prompt::Event;
 use crate::{command, composer};
 use crate::{proc, repo, strip, terminal};
@@ -57,6 +59,8 @@ pub struct Config {
 struct Attachment {
     url: String,
     mime: String,
+    /// The imeta fields Buzz needs to attach the same upload again.
+    imeta: Value,
 }
 
 pub fn run(config: &Config, event: &Event, reply_to: Option<&str>) {
@@ -102,6 +106,8 @@ fn handle(config: &Config, event: &Event, work: &Path) -> Reply {
 
     let mut args = request.args.clone();
     let mut ignored_images = 0;
+    let mut origin =
+        json!({ "mode": if request.subcommand() == "edit" { "edit" } else { "generate" } });
     if request.subcommand() == "edit" && !request.has_flag("--src") {
         let images: Vec<&Attachment> = attachments
             .iter()
@@ -114,6 +120,7 @@ fn handle(config: &Config, event: &Event, work: &Path) -> Reply {
         if let Some(image) = images.first() {
             match download(config, image, work) {
                 Ok(path) => {
+                    origin["source"] = image.imeta.clone();
                     args.push("--src".into());
                     args.push(path.to_string_lossy().into_owned());
                 }
@@ -165,6 +172,7 @@ fn handle(config: &Config, event: &Event, work: &Path) -> Reply {
     }
 
     let (images, sidecars) = produced_files(&out_dir);
+    annotate_sidecars(&sidecars, &origin);
     let mut files = attachable(&images, work);
     files.extend(sidecars.iter().cloned());
 
@@ -185,16 +193,21 @@ fn handle(config: &Config, event: &Event, work: &Path) -> Reply {
         return Reply { content, files };
     }
 
-    // With an image, Buzz Desktop shows its prompt, model, size, time and
-    // history id in a sidebar built from the sidecar, so the reply carries only
-    // the saved location and any notes. The commit message, which has no
+    // With an image, Buzz Desktop shows its prompt, settings, source and repo
+    // location in a sidebar built from the sidecar, so the reply carries only
+    // notes (a failed save among them). The commit message, which has no
     // sidebar, is still built from mage's output.
     if let Some(spec) = request.repo.take() {
         let message = commit_message(&printed, &event.content);
-        notes.insert(
-            0,
-            save_to_repo(config, event, work, &spec, &images, &sidecars, &message),
-        );
+        let save = Save {
+            images: &images,
+            sidecars: &sidecars,
+            message: &message,
+            origin: &origin,
+        };
+        if let Err(e) = save_to_repo(config, event, work, &spec, &save) {
+            notes.insert(0, format!("Repo save failed: {e}"));
+        }
     }
     Reply {
         content: notes.join("\n"),
@@ -220,30 +233,55 @@ fn commit_message(reply: &str, request: &str) -> String {
     }
 }
 
+struct Save<'a> {
+    images: &'a [PathBuf],
+    sidecars: &'a [PathBuf],
+    message: &'a str,
+    origin: &'a Value,
+}
+
+/// Commits the job's files, with the sidecars naming the repo they were saved
+/// to (`<owner>/<repo>`; Buzz finds the image's folder in it by file name, so
+/// a later move is still found). A failed save takes that back out again.
 fn save_to_repo(
     config: &Config,
     event: &Event,
     work: &Path,
     spec: &str,
-    images: &[PathBuf],
-    sidecars: &[PathBuf],
-    message: &str,
-) -> String {
-    let result = repo::resolve_for(&config.buzz, &event.channel, &event.sender, spec)
-        .and_then(|target| repo::save(work, &target, images, sidecars, message));
-    match result {
-        Ok(saved) => format!(
-            "Saved to `{}` @ `{}`: {}",
-            saved.label,
-            saved.commit,
-            saved
-                .files
-                .iter()
-                .map(|f| format!("`{f}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Err(e) => format!("Repo save failed: {e}"),
+    save: &Save,
+) -> Result<(), String> {
+    let target = repo::resolve_for(&config.buzz, &event.channel, &event.sender, spec)?;
+    let mut saved_origin = save.origin.clone();
+    saved_origin["repo"] = repo_address(&target.repo).into();
+    annotate_sidecars(save.sidecars, &saved_origin);
+    repo::save(work, &target, save.images, save.sidecars, save.message)
+        .map(|_| ())
+        .inspect_err(|_| annotate_sidecars(save.sidecars, save.origin))
+}
+
+fn repo_address(repo: &repo::RepoInfo) -> String {
+    match repo.owner.as_deref().filter(|owner| !owner.is_empty()) {
+        Some(owner) => format!("{owner}/{}", repo.id),
+        None => repo.id.clone(),
+    }
+}
+
+/// Adds `origin` to each sidecar as `buzz`: how the image was made (`mode`,
+/// the edit's `source` upload) and where it was saved (`repo`). A sidecar mage
+/// wrote in another shape is left as it is.
+fn annotate_sidecars(sidecars: &[PathBuf], origin: &Value) {
+    for path in sidecars {
+        let Some(mut sidecar) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(raw.trim_start_matches('\u{feff}')).ok())
+            .filter(Value::is_object)
+        else {
+            continue;
+        };
+        sidecar["buzz"] = origin.clone();
+        if let Ok(out) = serde_json::to_string_pretty(&sidecar) {
+            let _ = std::fs::write(path, out);
+        }
     }
 }
 
@@ -308,9 +346,17 @@ fn attachments(tags: &[Vec<String>]) -> Vec<Attachment> {
                 tag.iter()
                     .find_map(|f| f.strip_prefix(name).map(str::to_string))
             };
+            let url = field("url ")?;
+            let mut imeta = json!({ "url": url });
+            for name in ["m", "x", "size", "dim"] {
+                if let Some(value) = field(&format!("{name} ")) {
+                    imeta[name] = value.into();
+                }
+            }
             Some(Attachment {
-                url: field("url ")?,
                 mime: field("m ").unwrap_or_default(),
+                url,
+                imeta,
             })
         })
         .collect()
@@ -442,12 +488,57 @@ mod tests {
                 "imeta".to_string(),
                 "url https://r/media/a.png".to_string(),
                 "m image/png".to_string(),
+                "x abc123".to_string(),
+                "dim 896x1152".to_string(),
+                "blurhash LKO2".to_string(),
             ],
         ];
         let found = attachments(&tags);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].url, "https://r/media/a.png");
         assert_eq!(found[0].mime, "image/png");
+        assert_eq!(
+            found[0].imeta,
+            json!({ "url": "https://r/media/a.png", "m": "image/png",
+                    "x": "abc123", "dim": "896x1152" })
+        );
+    }
+
+    #[test]
+    fn sidecars_get_the_origin_and_others_are_left_alone() {
+        let dir = std::env::temp_dir().join(format!("mage-annotate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("h1.json");
+        let other = dir.join("h2.json");
+        std::fs::write(&sidecar, "\u{feff}{\"prompt\":\"a fox\"}").unwrap();
+        std::fs::write(&other, "[1, 2]").unwrap();
+        let origin = json!({ "mode": "edit", "repo": "owner/site" });
+        annotate_sidecars(&[sidecar.clone(), other.clone()], &origin);
+        let read = |path: &Path| std::fs::read_to_string(path).unwrap();
+        let written: Value = serde_json::from_str(&read(&sidecar)).unwrap();
+        assert_eq!(written["prompt"], "a fox");
+        assert_eq!(written["buzz"], origin);
+        assert_eq!(read(&other), "[1, 2]");
+
+        annotate_sidecars(std::slice::from_ref(&sidecar), &json!({ "mode": "edit" }));
+        let written: Value = serde_json::from_str(&read(&sidecar)).unwrap();
+        assert_eq!(written["buzz"], json!({ "mode": "edit" }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repo_address_is_owner_and_id() {
+        let repo = |owner: Option<&str>| repo::RepoInfo {
+            id: "site".into(),
+            name: None,
+            clone: None,
+            branch: "main".into(),
+            owner: owner.map(str::to_string),
+            channel: None,
+        };
+        assert_eq!(repo_address(&repo(Some("ab12"))), "ab12/site");
+        assert_eq!(repo_address(&repo(Some(""))), "site");
+        assert_eq!(repo_address(&repo(None)), "site");
     }
 
     #[test]

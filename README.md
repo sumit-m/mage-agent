@@ -31,11 +31,18 @@ commit the image and its `.json` sidecar to a repository bound to the channel.
   says so; the image is still posted.
 - The commit message is mage's reply without its `url:` line (the CDN link
   expires after 30 days), on one line: `model: …, 10s, history_id: …`.
-- With an image, the reply (channel or DM) is only the saved location (if any)
-  and notes, then the image: Buzz Desktop hides the attached sidecar's file card
-  and shows its prompt, model, size, time and history id in a sidebar beside
-  the image. Other clients still see the `.json` as a file. Without an image,
-  the reply is mage's output.
+- With an image, the reply (channel or DM) is only notes (a failed repo save
+  among them), then the image: Buzz Desktop hides the attached sidecar's file
+  card and shows its prompt, model, size, time and history id in a sidebar
+  beside the image. Other clients still see the `.json` as a file. Without an
+  image, the reply is mage's output.
+- Each sidecar gets a `buzz` block: `mode` (`generate` or `edit`), the edit's
+  `source` upload (its imeta `url`, `m`, `x`, `size`, `dim`) and the `repo` it
+  was saved to (`<owner>/<repo>`, only once the save succeeded). Buzz's sidebar
+  uses it for the source image, Regenerate (the same request posted again by
+  the viewer) and the repo button, which finds the image in the repo by file
+  name and moves or copies it there. Desktop commits those moves as the Mage
+  agent too (its key, name and email), so the history reads the same.
 - Buzz's message-box panel (Generate/Edit, model, aspect, resolution, preset,
   repo folder) sends the prompt as the message text and its settings in a hidden
   `buzz-composer` tag. mage-agent passes every setting to mage explicitly; only

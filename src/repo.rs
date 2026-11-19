@@ -68,9 +68,9 @@ pub struct Target {
 }
 
 pub struct Saved {
-    pub label: String,
+    /// Repo paths written, images first.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub files: Vec<String>,
-    pub commit: String,
 }
 
 pub fn list_channel_repos(buzz: &Path, channel: &str) -> Result<Vec<RepoInfo>, String> {
@@ -332,9 +332,7 @@ pub fn save(
     }
 
     Ok(Saved {
-        label: repo.label().to_string(),
         files: placed.into_iter().map(|(_, rel)| rel).collect(),
-        commit: git(&clone, &["rev-parse", "--short", &commit])?,
     })
 }
 
