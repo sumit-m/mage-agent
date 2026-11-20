@@ -32,76 +32,23 @@ try {
 }
 
 if ($MageSource) {
-    foreach ($file in 'mage.exe', 'config.ini', 'presets.ini') {
+    foreach ($file in 'mage.exe', 'config.ini', 'presets.ini', 'models.ini') {
         $source = Join-Path $MageSource $file
         if (Test-Path $source) { Copy-Item $source $InstallDir -Force }
     }
 }
 if (-not (Test-Path (Join-Path $InstallDir 'mage.exe'))) {
-    Write-Warning "mage.exe is not in $InstallDir; pass -MageSource or copy it there with config.ini and presets.ini."
+    Write-Warning "mage.exe is not in $InstallDir; pass -MageSource or copy it there with config.ini, presets.ini and models.ini."
 }
 
 $appId = if ($App -eq 'dev') { 'xyz.block.buzz.app.dev' } else { 'xyz.block.buzz.app' }
 $harnessDir = Join-Path $env:APPDATA "$appId\custom_harnesses"
 New-Item -ItemType Directory -Force $harnessDir | Out-Null
 # Buzz's message-box panel. Values travel by control id; mage-agent maps them
-# to mage flags. Presets come from the installed presets.ini.
-function Read-Presets([string]$path) {
-    $presets = [ordered]@{}
-    $current = $null
-    if (-not (Test-Path $path)) { return $presets }
-    foreach ($line in Get-Content $path) {
-        $line = $line.Trim()
-        if ($line -match '^\[(.+)\]$') {
-            $current = $Matches[1].Trim()
-            $presets[$current] = @{}
-        } elseif ($current -and $line -match '^([a-z_]+)\s*=\s*(.*)$') {
-            $presets[$current][$Matches[1]] = $Matches[2].Trim()
-        }
-    }
-    return $presets
-}
-$presetOptions = @()
-$presets = Read-Presets (Join-Path $InstallDir 'presets.ini')
-foreach ($name in $presets.Keys) {
-    $values = $presets[$name]
-    $sets = [ordered]@{}
-    if ($values['model_id']) { $sets['model'] = $values['model_id'] }
-    if ($values['aspect_ratio']) { $sets['aspect'] = $values['aspect_ratio'] }
-    if ($values['resolution']) { $sets['res'] = $values['resolution'] }
-    $presetOptions += [ordered]@{ value = $name; label = $name; sets = $sets }
-}
-$controls = @(
-    [ordered]@{
-        id = 'model'; kind = 'list'; label = 'Model'; icon = 'sparkles'; default = 'mango-v4'; sidecarKey = 'model_id'
-        options = @(
-            [ordered]@{ value = 'mango-v4'; label = 'Mango 4' },
-            [ordered]@{ value = 'mango-v3-pro'; label = 'Mango 3' },
-            [ordered]@{ value = 'mango-v2'; label = 'Mango 2' })
-    },
-    [ordered]@{
-        id = 'aspect'; kind = 'shapes'; label = 'Aspect ratio'; default = 'portrait'; sidecarKey = 'aspect_ratio'
-        defaultByMode = @{ edit = 'auto' }
-        options = @(
-            [ordered]@{ value = 'auto'; label = 'Auto'; modes = @('edit') },
-            [ordered]@{ value = 'portrait'; label = 'Portrait'; size = @(896, 1152) },
-            [ordered]@{ value = 'landscape'; label = 'Landscape'; size = @(1216, 832) },
-            [ordered]@{ value = 'square'; label = 'Square'; size = @(1024, 1024) },
-            [ordered]@{ value = 'cinema'; label = 'Cinema'; size = @(1344, 768) },
-            [ordered]@{ value = 'computer'; label = 'Computer'; size = @(1152, 896) })
-    },
-    [ordered]@{
-        id = 'res'; kind = 'segmented'; label = 'Resolution'; default = '1K'; sidecarKey = 'resolution'
-        defaultByMode = @{ edit = 'auto' }
-        options = @(
-            [ordered]@{ value = 'auto'; label = 'Auto'; modes = @('edit') },
-            [ordered]@{ value = '1K'; label = '1K'; scale = 1 },
-            [ordered]@{ value = '2K'; label = '2K'; scale = 2 })
-    }
-)
-if ($presetOptions.Count -gt 0) {
-    $controls += [ordered]@{ id = 'preset'; kind = 'preset'; label = 'Preset'; icon = 'wand'; options = $presetOptions }
-}
+# to mage flags. `--refresh-panel` adds the Model, Aspect ratio and Resolution
+# menus from models.ini and the Preset menu from presets.ini, here and each
+# time one of those menus opens.
+$controls = @()
 # Filled from `mage assets --json`: Buzz runs `mage-agent --refresh-assets`
 # when either menu opens. A pick puts `@handle` in the prompt.
 foreach ($menu in @(
@@ -122,7 +69,7 @@ $definition = [ordered]@{
     label       = 'Mage'
     command     = (Join-Path $InstallDir 'mage-agent.exe')
     args        = @()
-    # mage-agent rebuilds the Preset menu here from presets.ini when it starts.
+    # mage-agent also rebuilds those menus here when it starts.
     env         = @{ MAGE_HARNESS_FILE = $harnessFile }
     installHint = 'Run install.ps1 from the mage-agent repository.'
     composer    = [ordered]@{
@@ -130,15 +77,17 @@ $definition = [ordered]@{
             [ordered]@{ id = 'generate'; label = 'Generate' },
             [ordered]@{ id = 'edit'; label = 'Edit'; requiresImage = $true; autoOnImage = $true })
         controls = $controls
-        # Buzz runs `mage-agent --refresh-presets` before each read of the
-        # panel, which rebuilds the Preset menu from presets.ini.
-        refresh  = @('--refresh-presets')
+        refresh  = @('--refresh-panel')
     }
 }
 $json = $definition | ConvertTo-Json -Depth 10
 [System.IO.File]::WriteAllText($harnessFile, $json, (New-Object System.Text.UTF8Encoding $false))
 
 $env:MAGE_HARNESS_FILE = $harnessFile
+& (Join-Path $InstallDir 'mage-agent.exe') --refresh-panel
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning 'Model, Aspect ratio, Resolution and Preset menus could not be read from models.ini and presets.ini.'
+}
 & (Join-Path $InstallDir 'mage-agent.exe') --refresh-assets
 if ($LASTEXITCODE -ne 0) {
     Write-Warning 'Character and Reference menus are empty until mage can list your assets; they refresh when opened.'

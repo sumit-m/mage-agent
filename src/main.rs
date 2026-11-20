@@ -12,6 +12,7 @@ mod assets;
 mod command;
 mod composer;
 mod job;
+mod models;
 mod presets;
 mod proc;
 mod prompt;
@@ -309,40 +310,50 @@ fn refresh_assets(config: &job::Config) -> bool {
     }
 }
 
-fn refresh_presets(config: &job::Config) -> bool {
+/// Rebuilds Buzz's Model, Aspect ratio, Resolution and Preset menus from the
+/// `models.ini` and `presets.ini` beside mage. Returns false when it couldn't.
+fn refresh_panel(config: &job::Config) -> bool {
     let Some(harness_file) = harness_file() else {
         return true;
     };
-    // mage found only on PATH (no install folder) has no presets.ini we can
+    // mage found only on PATH (no install folder) has no ini files we can
     // place, so the panel is left as it is rather than read from Buzz's cwd.
-    let Some(mage_dir) = config
-        .mage
-        .parent()
-        .filter(|dir| dir.is_absolute() && dir.is_dir())
-    else {
+    let Some(mage_dir) = config.mage_dir() else {
         return true;
     };
+    let models_ini = mage_dir.join("models.ini");
     let presets_ini = mage_dir.join("presets.ini");
-    match presets::refresh(&harness_file, &presets_ini) {
-        Ok(true) => {
-            eprintln!(
-                "mage-agent: presets refreshed from {}",
-                presets_ini.display()
-            );
-            true
-        }
-        Ok(false) => true,
-        Err(e) => {
-            eprintln!("mage-agent: presets not refreshed: {e}");
-            false
+    let results = [
+        (
+            "models",
+            models::refresh(&harness_file, &models_ini),
+            &models_ini,
+        ),
+        (
+            "presets",
+            presets::refresh(&harness_file, &presets_ini),
+            &presets_ini,
+        ),
+    ];
+    let mut ok = true;
+    for (what, result, ini) in results {
+        match result {
+            Ok(true) => eprintln!("mage-agent: {what} refreshed from {}", ini.display()),
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("mage-agent: {what} not refreshed: {e}");
+                ok = false;
+            }
         }
     }
+    ok
 }
 
 fn main() {
     let config = config();
     let refresh = std::env::args().skip(1).find_map(|arg| match arg.as_str() {
-        "--refresh-presets" => Some(refresh_presets as fn(&job::Config) -> bool),
+        // `--refresh-presets` is what harness files from before models.ini name.
+        "--refresh-panel" | "--refresh-presets" => Some(refresh_panel as fn(&job::Config) -> bool),
         "--refresh-assets" => Some(refresh_assets),
         _ => None,
     });
@@ -355,7 +366,7 @@ fn main() {
         config.mage.display(),
         config.buzz.display()
     );
-    refresh_presets(&config);
+    refresh_panel(&config);
     let work_root = config.work_root.clone();
     std::thread::spawn(move || job::sweep_stale(&work_root));
     let agent = Arc::new(Agent {

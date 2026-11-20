@@ -32,7 +32,7 @@ pub fn parse(text: &str) -> Vec<(String, Vec<(String, String)>)> {
             (presets.last_mut(), line.split_once('='))
         {
             let key = key.trim();
-            if !key.is_empty() && key.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+            if !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
                 fields.push((key.to_string(), value.trim().to_string()));
             }
         }
@@ -40,7 +40,7 @@ pub fn parse(text: &str) -> Vec<(String, Vec<(String, String)>)> {
     presets
 }
 
-fn usable_name(name: &str) -> bool {
+pub(crate) fn usable_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_TEXT
         && !name
@@ -64,7 +64,13 @@ pub fn preset_control(presets: &[(String, Vec<(String, String)>)]) -> Option<Val
             let mut sets = Map::new();
             for (field, control) in SETS {
                 if let Some((_, value)) = fields.iter().find(|(k, v)| k == field && !v.is_empty()) {
-                    sets.insert(control.to_string(), Value::String(value.clone()));
+                    // The panel offers resolutions upper-case (see models.rs).
+                    let value = if control == "res" {
+                        value.to_ascii_uppercase()
+                    } else {
+                        value.clone()
+                    };
+                    sets.insert(control.to_string(), Value::String(value));
                 }
             }
             json!({ "value": name, "label": name, "sets": sets })
@@ -129,7 +135,7 @@ pub fn harness_file_for(dirs: &[PathBuf], exe: &Path) -> Option<PathBuf> {
 
 /// `presets.ini` as text: UTF-8 with or without a byte-order mark, UTF-16
 /// (Notepad's "Unicode"), or anything else with bad bytes replaced.
-fn decode(bytes: &[u8]) -> String {
+pub(crate) fn decode(bytes: &[u8]) -> String {
     let utf16 = |bytes: &[u8], from: fn([u8; 2]) -> u16| {
         let units: Vec<u16> = bytes
             .chunks_exact(2)
@@ -155,8 +161,23 @@ pub fn refresh(harness_file: &Path, presets_ini: &Path) -> Result<bool, String> 
         Err(e) => return Err(format!("{}: {e}", presets_ini.display())),
     };
     update_controls(harness_file, |controls| {
-        replace_preset(controls, preset_control(&parse(&text)))
+        let mut control = preset_control(&parse(&text));
+        if let Some(control) = &mut control {
+            without_unknown_sets(control, controls);
+        }
+        replace_preset(controls, control)
     })
+}
+
+/// Buzz rejects the whole panel when a preset sets a control it lacks (no
+/// models.ini, so no Model menu), so those settings are dropped.
+fn without_unknown_sets(preset: &mut Value, controls: &[Value]) {
+    let known = |id: &str| controls.iter().any(|c| c["id"] == id);
+    for option in preset["options"].as_array_mut().into_iter().flatten() {
+        if let Some(sets) = option["sets"].as_object_mut() {
+            sets.retain(|id, _| known(id));
+        }
+    }
 }
 
 /// Applies `change` to the harness file's panel controls and writes the file
@@ -203,7 +224,7 @@ mod tests {
                        [wide shot]\n\
                        aspect_ratio = cinema\n\
                        [night]\n\
-                       resolution = 2K\n";
+                       resolution = 2k\n";
 
     #[test]
     fn parse_keeps_sections_in_order() {
@@ -245,6 +266,14 @@ mod tests {
         );
         assert_eq!(options[1]["sets"], json!({ "res": "2K" }));
         assert!(preset_control(&parse("; none\n")).is_none());
+    }
+
+    #[test]
+    fn sets_for_missing_controls_are_dropped() {
+        let mut control = preset_control(&parse(INI)).unwrap();
+        without_unknown_sets(&mut control, &[json!({ "id": "aspect" })]);
+        assert_eq!(control["options"][0]["sets"], json!({ "aspect": "square" }));
+        assert_eq!(control["options"][1]["sets"], json!({}));
     }
 
     #[test]

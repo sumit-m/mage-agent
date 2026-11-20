@@ -47,14 +47,22 @@ commit the image and its `.json` sidecar to a repository bound to the channel.
   repo folder) sends the prompt as the message text and its settings in a hidden
   `buzz-composer` tag. mage-agent passes every setting to mage explicitly; only
   Edit's Auto aspect and resolution leave the flag out. `@name` words in the
-  prompt are kept for mage. `install.ps1` writes the panel into `mage.json`,
-  with presets read from `presets.ini`. Each control's `sidecarKey` names the
-  sidecar field it comes from, so Edit on a chat image starts from its settings.
-- The Preset menu follows `presets.ini` live: the panel's `refresh` entry makes
-  Buzz run `mage-agent --refresh-presets` (with `BUZZ_HARNESS_FILE` naming
-  `mage.json`) before each read of the panel, on every `@mage` and at most
-  once a minute. mage-agent also refreshes when it starts as an agent. Presets
-  whose names have spaces or quotes are left out, since Buzz would reject the
+  prompt are kept for mage. `install.ps1` writes the panel into `mage.json`.
+  Each control's `sidecarKey` names the sidecar field it comes from, so Edit on
+  a chat image starts from its settings.
+- The Model, Aspect ratio and Resolution menus come from mage's `models.ini`,
+  and the Preset menu from `presets.ini`. The panel's `refresh` entry makes
+  Buzz run `mage-agent --refresh-panel` (with `BUZZ_HARNESS_FILE` naming
+  `mage.json`) when one of those menus opens, so an ini edit shows up without
+  a reinstall; mage-agent also refreshes when it starts as an agent. Each
+  aspect and resolution is offered only for the models that list it, with the
+  model's `aspect_size_<res>` pixel sizes. On a model switch an aspect or
+  resolution the new model has is kept; one it lacks becomes the new model's
+  `aspect_default` / `res_default`. Speed shows under each model. Resolutions
+  are offered upper-case (mage accepts either case). mage-agent adds `--arch`
+  from `models.ini` for the chosen model, since mage defaults it to mango.
+  Presets whose names have spaces or quotes are left out, and a preset's
+  setting for a menu the panel lacks is dropped, since Buzz would reject the
   whole panel.
 - The panel's Character and Reference menus list your mage assets (`mage
   assets --json`, written into `mage.json` by `mage-agent --refresh-assets`,
@@ -79,7 +87,7 @@ commit the image and its `.json` sidecar to a repository bound to the channel.
 ```
 
 This builds the release binary, puts `mage-agent.exe` (and, with
-`-MageSource`, `mage.exe`, `config.ini`, `presets.ini`, replacing any installed
+`-MageSource`, `mage.exe`, `config.ini`, `presets.ini`, `models.ini`, replacing any installed
 copies) in `%LOCALAPPDATA%\Programs\mage`, and writes
 `%APPDATA%\xyz.block.buzz.app.dev\custom_harnesses\mage.json`. `just reset`
 deletes that file; run the script again afterwards. Use `-App prod` for the

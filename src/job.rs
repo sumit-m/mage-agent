@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::prompt::Event;
-use crate::{command, composer};
+use crate::{command, composer, models};
 use crate::{proc, repo, strip, terminal};
 
 /// Includes time spent waiting in mage's queue; stays under buzz-acp's 2-hour turn cap.
@@ -54,6 +54,16 @@ pub struct Config {
     pub buzz: PathBuf,
     pub display_name: Option<String>,
     pub work_root: PathBuf,
+}
+
+impl Config {
+    /// mage's install folder, where its ini files live; `None` for a mage
+    /// found only on PATH.
+    pub fn mage_dir(&self) -> Option<&Path> {
+        self.mage
+            .parent()
+            .filter(|dir| dir.is_absolute() && dir.is_dir())
+    }
 }
 
 struct Attachment {
@@ -105,6 +115,14 @@ fn handle(config: &Config, event: &Event, work: &Path) -> Reply {
     };
 
     let mut args = request.args.clone();
+    if request.produces_images() && !request.has_flag("--arch") {
+        // mage defaults `--arch` to mango whatever the model.
+        let arch = flag_value(&args, "--model")
+            .and_then(|model| models::architecture(&config.mage_dir()?.join("models.ini"), model));
+        if let Some(arch) = arch {
+            args.extend(["--arch".into(), arch]);
+        }
+    }
     let mut ignored_images = 0;
     let mut origin =
         json!({ "mode": if request.subcommand() == "edit" { "edit" } else { "generate" } });
@@ -307,6 +325,18 @@ fn localize_repo_src(
 }
 
 /// Index of the `--src` value, the text before it in that argument, and the value.
+/// The value of `--flag value` or `--flag=value`.
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let with_value = format!("{flag}=");
+    args.iter().enumerate().find_map(|(i, arg)| {
+        if arg == flag {
+            args.get(i + 1).map(String::as_str)
+        } else {
+            arg.strip_prefix(&with_value)
+        }
+    })
+}
+
 fn src_value(args: &[String]) -> Option<(usize, &'static str, String)> {
     args.iter().enumerate().find_map(|(i, arg)| {
         if arg == "--src" {
@@ -549,6 +579,17 @@ mod tests {
         assert!(!is_repo_ref("d:/pics/a.png"));
         assert!(!is_repo_ref("pics/a.png"));
         assert!(!is_repo_ref("https://cdn/x.png"));
+    }
+
+    #[test]
+    fn flag_value_forms() {
+        let args: Vec<String> = ["gen", "--model", "flux2-dev", "--res=2K", "--aspect"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(flag_value(&args, "--model"), Some("flux2-dev"));
+        assert_eq!(flag_value(&args, "--res"), Some("2K"));
+        assert_eq!(flag_value(&args, "--aspect"), None);
+        assert_eq!(flag_value(&args, "--arch"), None);
     }
 
     #[test]
