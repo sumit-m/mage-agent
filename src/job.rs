@@ -123,33 +123,35 @@ fn handle(config: &Config, event: &Event, work: &Path) -> Reply {
             args.extend(["--arch".into(), arch]);
         }
     }
-    let mut ignored_images = 0;
-    let mut origin =
-        json!({ "mode": if request.subcommand() == "edit" { "edit" } else { "generate" } });
-    if request.subcommand() == "edit" && !request.has_flag("--src") {
-        let images: Vec<&Attachment> = attachments
-            .iter()
-            .filter(|a| a.mime.starts_with("image/"))
-            .collect();
-        if images.is_empty() {
-            return Reply::text("Attach an image to edit.".into());
-        }
-        ignored_images = images.len() - 1;
-        if let Some(image) = images.first() {
-            match download(config, image, work) {
+    // Every attached image goes to mage, in order: the first is the primary,
+    // the rest are `@image2`… A request naming its own `--image` keeps it.
+    let mut sources = Vec::new();
+    if request.produces_images() && !request.has_flag("--image") {
+        let images = attachments.iter().filter(|a| a.mime.starts_with("image/"));
+        for (index, image) in images.enumerate() {
+            match download(config, image, work, index + 1) {
                 Ok(path) => {
-                    origin["source"] = image.imeta.clone();
-                    args.push("--src".into());
+                    sources.push(image.imeta.clone());
+                    args.push("--image".into());
                     args.push(path.to_string_lossy().into_owned());
                 }
                 Err(e) => {
-                    return Reply::text(format!("Could not download the attached image: {e}"))
+                    return Reply::text(format!(
+                        "Could not download attached image {}: {e}",
+                        index + 1
+                    ))
                 }
             }
         }
     }
-    if let Err(e) = localize_repo_src(config, event, &mut args, work) {
-        return Reply::text(format!("Could not get the `--src` image: {e}"));
+    let mut origin = json!({ "mode": if sources.is_empty() { "generate" } else { "edit" } });
+    if let Some(first) = sources.first() {
+        // Desktops before multi-image sources read only `source`.
+        origin["source"] = first.clone();
+        origin["sources"] = sources.into();
+    }
+    if let Err(e) = localize_repo_images(config, event, &mut args, work) {
+        return Reply::text(format!("Could not get the `--image` image: {e}"));
     }
     let out_dir = work.join("out");
     if request.produces_images() {
@@ -180,12 +182,6 @@ fn handle(config: &Config, event: &Event, work: &Path) -> Reply {
         notes.push(format!(
             "mage exited with code {}.",
             output.code.unwrap_or(-1)
-        ));
-    }
-    if ignored_images > 0 {
-        let plural = if ignored_images == 1 { "" } else { "s" };
-        notes.push(format!(
-            "Edited the first attached image; {ignored_images} other image{plural} ignored."
         ));
     }
 
@@ -285,8 +281,8 @@ fn repo_address(repo: &repo::RepoInfo) -> String {
 }
 
 /// Adds `origin` to each sidecar as `buzz`: how the image was made (`mode`,
-/// the edit's `source` upload) and where it was saved (`repo`). A sidecar mage
-/// wrote in another shape is left as it is.
+/// the `sources` uploads in order) and where it was saved (`repo`). A sidecar
+/// mage wrote in another shape is left as it is.
 fn annotate_sidecars(sidecars: &[PathBuf], origin: &Value) {
     for path in sidecars {
         let Some(mut sidecar) = std::fs::read_to_string(path)
@@ -303,28 +299,26 @@ fn annotate_sidecars(sidecars: &[PathBuf], origin: &Value) {
     }
 }
 
-/// Replaces a `--src <repo>:<path>` value with a local copy of that file.
-fn localize_repo_src(
+/// Replaces each `--image <repo>:<path>` value with a local copy of that file.
+fn localize_repo_images(
     config: &Config,
     event: &Event,
     args: &mut [String],
     work: &Path,
 ) -> Result<(), String> {
-    let Some((index, prefix, value)) = src_value(args) else {
-        return Ok(());
-    };
-    if !is_repo_ref(&value) {
-        return Ok(());
+    for (count, (index, prefix, value)) in image_values(args).into_iter().enumerate() {
+        if !is_repo_ref(&value) {
+            continue;
+        }
+        let target = repo::resolve_for(&config.buzz, &event.channel, &event.sender, &value)?;
+        let dest_dir = work.join(format!("src{}", count + 1));
+        std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
+        let local = repo::fetch_file(work, &target, &dest_dir)?;
+        args[index] = format!("{prefix}{}", local.to_string_lossy());
     }
-    let target = repo::resolve_for(&config.buzz, &event.channel, &event.sender, &value)?;
-    let dest_dir = work.join("src");
-    std::fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
-    let local = repo::fetch_file(work, &target, &dest_dir)?;
-    args[index] = format!("{prefix}{}", local.to_string_lossy());
     Ok(())
 }
 
-/// Index of the `--src` value, the text before it in that argument, and the value.
 /// The value of `--flag value` or `--flag=value`.
 fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     let with_value = format!("{flag}=");
@@ -337,15 +331,20 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     })
 }
 
-fn src_value(args: &[String]) -> Option<(usize, &'static str, String)> {
-    args.iter().enumerate().find_map(|(i, arg)| {
-        if arg == "--src" {
-            args.get(i + 1).map(|v| (i + 1, "", v.clone()))
-        } else {
-            arg.strip_prefix("--src=")
-                .map(|v| (i, "--src=", v.to_string()))
-        }
-    })
+/// Each `--image` value: its argument's index, the text before it in that
+/// argument, and the value.
+fn image_values(args: &[String]) -> Vec<(usize, &'static str, String)> {
+    args.iter()
+        .enumerate()
+        .filter_map(|(i, arg)| {
+            if arg == "--image" {
+                args.get(i + 1).map(|v| (i + 1, "", v.clone()))
+            } else {
+                arg.strip_prefix("--image=")
+                    .map(|v| (i, "--image=", v.to_string()))
+            }
+        })
+        .collect()
 }
 
 /// `<repo>:<path>`, as opposed to a local path such as `C:\pics\a.png`.
@@ -392,14 +391,19 @@ fn attachments(tags: &[Vec<String>]) -> Vec<Attachment> {
         .collect()
 }
 
-fn download(config: &Config, image: &Attachment, work: &Path) -> Result<PathBuf, String> {
+fn download(
+    config: &Config,
+    image: &Attachment,
+    work: &Path,
+    number: usize,
+) -> Result<PathBuf, String> {
     let ext = match image.mime.as_str() {
         "image/png" => "png",
         "image/webp" => "webp",
         "image/gif" => "gif",
         _ => "jpg",
     };
-    let path = work.join(format!("source.{ext}"));
+    let path = work.join(format!("image{number}.{ext}"));
     let mut cmd = proc::command(&config.buzz);
     cmd.args(["media", "get", &image.url, "--output"])
         .arg(&path);
@@ -593,17 +597,22 @@ mod tests {
     }
 
     #[test]
-    fn src_value_forms() {
+    fn image_value_forms() {
         let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            src_value(&args(&["edit", "--src", "site:a.jpg", "x"])),
-            Some((2, "", "site:a.jpg".to_string()))
+            image_values(&args(&[
+                "generate",
+                "--image",
+                "site:a.jpg",
+                "x",
+                "--image=site:b.jpg"
+            ])),
+            [
+                (2, "", "site:a.jpg".to_string()),
+                (4, "--image=", "site:b.jpg".to_string())
+            ]
         );
-        assert_eq!(
-            src_value(&args(&["edit", "--src=site:a.jpg"])),
-            Some((1, "--src=", "site:a.jpg".to_string()))
-        );
-        assert_eq!(src_value(&args(&["edit", "x"])), None);
+        assert_eq!(image_values(&args(&["generate", "x"])), []);
     }
 
     #[test]

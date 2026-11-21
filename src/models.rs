@@ -7,6 +7,12 @@
 //! and falls back to the model's own defaults (`defaults`) when a pick isn't
 //! offered after a model switch. Resolutions are offered upper-case: mage
 //! accepts either case and sends each model the case it needs.
+//!
+//! Images are attached to `generate` (mage 0.7): while any are attached, Auto
+//! (the primary image's own size) is offered and preselected. Each model
+//! caps the images (`max_refs` → `maxImages`); only Mango honours images past
+//! the first, so only Mango models take `@image2` references (`imageRefs`),
+//! and only models with `assets=yes` show the Character and Reference menus.
 
 use std::path::Path;
 
@@ -31,7 +37,14 @@ pub struct Model {
     /// `(resolution, size per aspect)`, sizes in `aspects` order.
     sizes: Vec<(String, Vec<Option<[u32; 2]>>)>,
     speed: Option<String>,
+    /// Images one prompt may attach (`max_refs`), the primary included.
+    max_refs: Option<u32>,
+    /// Character and reference `@handles` supported (`assets`, default yes).
+    assets: bool,
 }
+
+/// mage: "Only Mango honors the extra references".
+const REFERENCE_ARCHITECTURE: &str = "mango";
 
 impl Model {
     fn size(&self, aspect: &str, res: &str) -> Option<[u32; 2]> {
@@ -111,6 +124,8 @@ pub fn parse(text: &str) -> Vec<Model> {
                     .map(str::to_ascii_uppercase)
                     .filter(|r| resolutions.contains(r)),
                 speed: get("speed").map(capitalized),
+                max_refs: get("max_refs").and_then(|n| n.trim().parse().ok()).filter(|n| *n > 0),
+                assets: !get("assets").is_some_and(|a| a.eq_ignore_ascii_case("no")),
                 id,
                 architecture,
                 display,
@@ -147,7 +162,7 @@ fn when_models(ids: &[&str], of: &[&str]) -> Option<Value> {
 }
 
 fn auto() -> Value {
-    json!({ "value": "auto", "label": "Auto", "modes": ["edit"] })
+    json!({ "value": "auto", "label": "Auto", "when": { "@images": ["attached"] } })
 }
 
 /// The Model, Aspect ratio and Resolution controls, or `None` without models.
@@ -174,6 +189,12 @@ pub fn controls(models: &[Model]) -> Option<[Value; 3]> {
             }
             if !defaults.is_empty() {
                 option["defaults"] = defaults.into();
+            }
+            if let Some(max) = model.max_refs {
+                option["maxImages"] = max.into();
+                if max > 1 && model.architecture == REFERENCE_ARCHITECTURE {
+                    option["imageRefs"] = true.into();
+                }
             }
             option
         })
@@ -263,13 +284,13 @@ pub fn controls(models: &[Model]) -> Option<[Value; 3]> {
         json!({
             "id": "aspect", "kind": "shapes", "label": "Aspect ratio",
             "default": default.aspect_default.as_ref().unwrap_or(&default.aspects[0]),
-            "defaultByMode": { "edit": "auto" }, "sidecarKey": "aspect_ratio",
+            "defaultWithImages": "auto", "sidecarKey": "aspect_ratio",
             "options": aspect_options.collect::<Vec<_>>()
         }),
         json!({
             "id": "res", "kind": "segmented", "label": "Resolution",
             "default": default.res_default.as_ref().unwrap_or(&default.resolutions[0]),
-            "defaultByMode": { "edit": "auto" }, "sidecarKey": "resolution",
+            "defaultWithImages": "auto", "sidecarKey": "resolution",
             "options": res_options.collect::<Vec<_>>()
         }),
     ])
@@ -307,14 +328,60 @@ fn read(models_ini: &Path) -> Result<Vec<Model>, String> {
     }
 }
 
-/// Rewrites the harness file's model, aspect and resolution controls from
-/// `models_ini`. Without models the controls are left as they are. Returns
-/// whether the file changed.
+/// The panel's one mode: images and video share the toggle, and mage makes
+/// images only. Attached images, not a mode, make a request image-to-image.
+fn modes() -> Value {
+    json!([{ "id": "image", "label": "Image" }])
+}
+
+/// Limits the Character and Reference menus to models with `assets=yes`.
+fn limit_asset_menus(controls: &mut [Value], models: &[Model]) -> bool {
+    let all: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    let with_assets: Vec<&str> = models
+        .iter()
+        .filter(|m| m.assets)
+        .map(|m| m.id.as_str())
+        .collect();
+    let when = when_models(&with_assets, &all);
+    let mut changed = false;
+    for control in controls.iter_mut().filter(|c| c["kind"] == "assets") {
+        let Some(fields) = control.as_object_mut() else {
+            continue;
+        };
+        let before = fields.get("when").cloned();
+        match &when {
+            Some(when) => {
+                fields.insert("when".into(), when.clone());
+            }
+            None => {
+                fields.remove("when");
+            }
+        }
+        changed |= fields.get("when").cloned() != before;
+    }
+    changed
+}
+
+/// Rewrites the harness file's mode, its model, aspect and resolution
+/// controls, and its asset menus' models from `models_ini`. Without models
+/// the file is left as it is. Returns whether the file changed.
 pub fn refresh(harness_file: &Path, models_ini: &Path) -> Result<bool, String> {
-    let Some(new) = controls(&read(models_ini)?) else {
+    let models = read(models_ini)?;
+    let Some(new) = controls(&models) else {
         return Ok(false);
     };
-    presets::update_controls(harness_file, |controls| apply(controls, new))
+    presets::update_composer(harness_file, |composer| {
+        let mut changed = false;
+        if composer.get("modes") != Some(&modes()) {
+            composer["modes"] = modes();
+            changed = true;
+        }
+        if let Some(controls) = composer.get_mut("controls").and_then(Value::as_array_mut) {
+            changed |= apply(controls, new);
+            changed |= limit_asset_menus(controls, &models);
+        }
+        changed
+    })
 }
 
 /// The architecture `models_ini` gives `model`, which mage needs as `--arch`.
@@ -360,6 +427,66 @@ mod tests {
         resolutions=1K\n\
         [broken]\n\
         display=No architecture\n";
+
+    /// mage 0.7's image keys on top of `INI`.
+    fn with_image_keys() -> String {
+        INI.replace("speed=slow\n[flux2-dev]", "max_refs=10\nassets=yes\nspeed=slow\n[flux2-dev]")
+            .replace("speed=slow\n[clip]", "max_refs=3\nassets=no\nspeed=slow\n[clip]")
+    }
+
+    #[test]
+    fn image_limits_references_and_auto_follow_the_model() {
+        let models = parse(&with_image_keys());
+        assert_eq!(models[0].max_refs, Some(10));
+        assert!(models[0].assets && !models[1].assets);
+        let [model, aspect, res] = controls(&models).unwrap();
+        assert_eq!(model["options"][0]["maxImages"], 10);
+        assert_eq!(model["options"][0]["imageRefs"], true);
+        assert_eq!(model["options"][1]["maxImages"], 3);
+        assert!(model["options"][1].get("imageRefs").is_none());
+        for control in [&aspect, &res] {
+            assert_eq!(control["defaultWithImages"], "auto");
+            assert!(control.get("defaultByMode").is_none());
+            assert_eq!(
+                control["options"][0],
+                json!({ "value": "auto", "label": "Auto", "when": { "@images": ["attached"] } })
+            );
+        }
+        let plain = parse(INI);
+        assert!(plain[0].max_refs.is_none() && plain[0].assets);
+    }
+
+    #[test]
+    fn refresh_sets_the_image_mode_and_limits_asset_menus() {
+        let dir = std::env::temp_dir().join(format!("mage-modes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("mage.json");
+        let ini = dir.join("models.ini");
+        std::fs::write(
+            &file,
+            json!({ "composer": {
+                "modes": [{ "id": "generate", "label": "Generate" },
+                          { "id": "edit", "label": "Edit", "requiresImage": true }],
+                "controls": [{ "id": "character", "kind": "assets", "options": [] }]
+            } })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(&ini, with_image_keys()).unwrap();
+        assert!(refresh(&file, &ini).unwrap());
+        let harness: Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(harness["composer"]["modes"], modes());
+        let character = harness["composer"]["controls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "character")
+            .unwrap();
+        assert_eq!(character["when"], json!({ "model": ["mango-v4"] }));
+        assert!(!refresh(&file, &ini).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parse_keeps_image_models_with_what_they_need() {

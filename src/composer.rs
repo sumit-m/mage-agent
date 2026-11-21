@@ -3,7 +3,8 @@
 //! tag; this module turns them into a mage command. Flags are never shown in
 //! Buzz, so every setting is passed explicitly rather than left to mage's
 //! defaults. The one omission is `auto`: mage has no auto value, and leaving
-//! `--aspect` or `--res` out is how `edit` matches the source image.
+//! `--aspect` or `--res` out is how `generate --image` matches the primary
+//! image. The attached images themselves are added by `job`.
 
 use std::collections::BTreeMap;
 
@@ -44,14 +45,15 @@ pub fn request(
             payload.v
         ));
     }
-    let (subcommand, aspect_default, res_default) = match payload.mode.as_str() {
-        "generate" => ("gen", "portrait", "1K"),
-        "edit" => ("edit", "auto", "auto"),
+    // `image` is the panel's one mode; `generate` and `edit` come from older panels.
+    let (aspect_default, res_default) = match payload.mode.as_str() {
+        "image" | "generate" => ("portrait", "1K"),
+        "edit" => ("auto", "auto"),
         other => return Err(format!("Unknown panel mode `{other}`.")),
     };
     let prompt = prompt_text(content, attachment_urls, display_name);
     if prompt.is_empty() {
-        return Err("Write a prompt first.".into());
+        return Err("A prompt is required to continue.".into());
     }
 
     let setting = |id: &str, default: &'static str| -> Result<String, String> {
@@ -62,7 +64,7 @@ pub fn request(
         Ok(value.to_string())
     };
 
-    let mut args = vec![subcommand.to_string(), "--prompt".into(), prompt];
+    let mut args = vec!["generate".to_string(), "--prompt".into(), prompt];
     args.extend(["--model".into(), setting("model", "mango-v4")?]);
     for (id, flag, default) in [
         ("aspect", "--aspect", aspect_default),
@@ -133,7 +135,7 @@ mod tests {
         assert_eq!(
             r.args,
             [
-                "gen",
+                "generate",
                 "--prompt",
                 "a red fox --aspect cinema",
                 "--model",
@@ -153,7 +155,7 @@ mod tests {
         assert_eq!(
             r.args,
             [
-                "gen", "--prompt", "a cat", "--model", "mango-v4", "--aspect", "portrait", "--res",
+                "generate", "--prompt", "a cat", "--model", "mango-v4", "--aspect", "portrait", "--res",
                 "1K"
             ]
         );
@@ -161,7 +163,26 @@ mod tests {
     }
 
     #[test]
-    fn edit_auto_leaves_aspect_and_res_out() {
+    fn the_image_mode_is_generate() {
+        let r = run(
+            "@Mage the fox from @image1 on @image2",
+            r#"{"v":1,"mode":"image","controls":{"model":"mango-v4","aspect":"auto","res":"auto"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            r.args,
+            [
+                "generate",
+                "--prompt",
+                "the fox from @image1 on @image2",
+                "--model",
+                "mango-v4"
+            ]
+        );
+    }
+
+    #[test]
+    fn older_edit_panels_are_generate_with_auto_left_out() {
         let r = run(
             "@Mage make it night",
             r#"{"v":1,"mode":"edit","controls":{"model":"mango-v4","aspect":"auto","res":"2K","preset":"logo"}}"#,
@@ -170,7 +191,7 @@ mod tests {
         assert_eq!(
             r.args,
             [
-                "edit",
+                "generate",
                 "--prompt",
                 "make it night",
                 "--model",

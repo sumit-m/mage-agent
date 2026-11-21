@@ -8,19 +8,24 @@ commit the image and its `.json` sidecar to a repository bound to the channel.
 @mage gen a red fox at dawn --aspect landscape --res 2K
 @mage gen --preset logo acme rocket --repo assets/logos/
 @mage gen a red fox --repo site:img/hero.jpg
-@mage edit make the sky purple            (with an image attached to the message)
-@mage edit --src C:\pics\cat.png add a hat
-@mage edit --src site:img/hero.jpg make it night --repo site:img/
+@mage gen make the sky purple             (with an image attached to the message)
+@mage gen the fox from @image1 on @image2  (with two images attached)
+@mage gen add a hat --image C:\pics\cat.png
+@mage gen make it night --image site:img/hero.jpg --repo site:img/
 @mage jobs
 ```
 
 - Every mage command and flag passes through unchanged, except `--output`, which
   mage-agent sets to a temp directory.
-- `edit` without `--src` uses the first image attached to the same message.
+- Every image attached to the message goes to mage as `--image`, in order (mage
+  0.7 folded `edit` into `generate --image`): the first is the primary, the rest
+  are `@image2`, `@image3`… in the prompt. A request with its own `--image` keeps
+  it instead. An older `edit --src` message still works; it becomes
+  `generate --image`.
 - `<repo>` may be `<owner-hex>/<repo>`. A repo bound to the request's channel is
   used as is; one named that way from elsewhere (a DM) is used only when the
   requester owns it or is a member of the channel it's bound to.
-- `--src <repo>:<path>` takes the file from the default branch of a repository
+- `--image <repo>:<path>` takes the file from the default branch of a repository
   bound to the channel (by id or name). Drive paths such as `C:\…` stay local.
 - `--repo <path>` uses the channel's only bound repository; `--repo <repo>:<path>`
   picks one by id or name. A path ending in `/`, or without a file extension, is
@@ -36,18 +41,26 @@ commit the image and its `.json` sidecar to a repository bound to the channel.
   card and shows its prompt, model, size, time and history id in a sidebar
   beside the image. Other clients still see the `.json` as a file. Without an
   image, the reply is mage's output.
-- Each sidecar gets a `buzz` block: `mode` (`generate` or `edit`), the edit's
-  `source` upload (its imeta `url`, `m`, `x`, `size`, `dim`) and the `repo` it
-  was saved to (`<owner>/<repo>`, only once the save succeeded). Buzz's sidebar
-  uses it for the source image, Regenerate (the same request posted again by
+- Each sidecar gets a `buzz` block: `mode` (`edit` with images, else
+  `generate`), the attached images as `sources` (each upload's imeta `url`, `m`,
+  `x`, `size`, `dim`, in order; `source` repeats the first for older Desktops)
+  and the `repo` it was saved to (`<owner>/<repo>`, only once the save
+  succeeded). The sources are never saved to the repo. Buzz's sidebar uses the
+  block for the source images, Regenerate (the same request and images posted again by
   the viewer) and the repo button, which finds the image in the repo by file
   name and moves or copies it there. Desktop commits those moves as the Mage
   agent too (its key, name and email), so the history reads the same.
-- Buzz's message-box panel (Generate/Edit, model, aspect, resolution, preset,
+- Buzz's message-box panel (an Image toggle, model, aspect, resolution, preset,
   repo folder) sends the prompt as the message text and its settings in a hidden
   `buzz-composer` tag. mage-agent passes every setting to mage explicitly; only
-  Edit's Auto aspect and resolution leave the flag out. `@name` words in the
-  prompt are kept for mage. `install.ps1` writes the panel into `mage.json`.
+  Auto aspect and resolution, offered while images are attached, leave the flag
+  out so mage follows the primary image. `@name` words in the prompt are kept
+  for mage. `install.ps1` writes the panel into `mage.json`.
+- On Mango models an attached image can be put in the prompt with its Insert
+  badge or `@` autocomplete: it shows as a small thumbnail and is sent as
+  `@image1`, `@image2`…. Send is blocked above the model's `max_refs`. FLUX 2 and
+  Z-Image use only the primary image, so they offer neither; a typed `@…` is
+  sent as is.
   Each control's `sidecarKey` names the sidecar field it comes from, so Edit on
   a chat image starts from its settings.
 - The Model, Aspect ratio and Resolution menus come from mage's `models.ini`,
@@ -64,7 +77,8 @@ commit the image and its `.json` sidecar to a repository bound to the channel.
   Presets whose names have spaces or quotes are left out, and a preset's
   setting for a menu the panel lacks is dropped, since Buzz would reject the
   whole panel.
-- The panel's Character and Reference menus list your mage assets (`mage
+- The panel's Character and Reference menus (shown only for models with
+  `assets=yes` in `models.ini`) list your mage assets (`mage
   assets --json`, written into `mage.json` by `mage-agent --refresh-assets`,
   which Buzz runs each time a menu opens and once per mention when you type
   `@`; `install.ps1` fills them once). A pick puts `@handle` in the prompt,
@@ -74,7 +88,7 @@ commit the image and its `.json` sidecar to a repository bound to the channel.
 - Overlapping requests each run the CLI, which queues them and runs one at a time.
 - Repositories are reached through a temporary blobless clone (`--depth 1
   --filter=blob:none`) deleted with the job: a save uploads only the new files
-  and `--src` fetches only that file. A relay that doesn't serve partial clones
+  and `--image` fetches only that file. A relay that doesn't serve partial clones
   sends every file of the latest commit instead.
 - Each job works in `%TEMP%\mage-agent\<message id>`, deleted once the reply is
   posted. A folder left by an agent stopped mid-job is removed the next time

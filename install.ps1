@@ -73,9 +73,8 @@ $definition = [ordered]@{
     env         = @{ MAGE_HARNESS_FILE = $harnessFile }
     installHint = 'Run install.ps1 from the mage-agent repository.'
     composer    = [ordered]@{
-        modes    = @(
-            [ordered]@{ id = 'generate'; label = 'Generate' },
-            [ordered]@{ id = 'edit'; label = 'Edit'; requiresImage = $true; autoOnImage = $true })
+        # Attached images, not a mode, make a request image-to-image.
+        modes    = @([ordered]@{ id = 'image'; label = 'Image' })
         controls = $controls
         refresh  = @('--refresh-panel')
     }

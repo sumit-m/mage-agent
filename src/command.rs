@@ -12,7 +12,7 @@ impl Request {
     }
 
     pub fn produces_images(&self) -> bool {
-        matches!(self.subcommand(), "generate" | "gen" | "edit")
+        matches!(self.subcommand(), "generate" | "gen")
     }
 
     pub fn has_flag(&self, flag: &str) -> bool {
@@ -58,17 +58,37 @@ pub fn parse_request(
         }
     }
 
-    let request = Request { args, repo };
+    let request = Request {
+        args: without_edit(args),
+        repo,
+    };
     if request.args.is_empty() {
         return Err(USAGE.into());
     }
     if request.repo.is_some() && !request.produces_images() {
         return Err(format!(
-            "`--repo` only works with `generate`, `gen` or `edit`, not `{}`.",
+            "`--repo` only works with `generate` or `gen`, not `{}`.",
             request.subcommand()
         ));
     }
     Ok(request)
+}
+
+/// mage 0.7 folded `edit --src` into `generate --image`; older messages
+/// still read the old way.
+fn without_edit(mut args: Vec<String>) -> Vec<String> {
+    if args.first().map(String::as_str) != Some("edit") {
+        return args;
+    }
+    args[0] = "generate".into();
+    for arg in args.iter_mut().skip(1) {
+        if arg == "--src" {
+            *arg = "--image".into();
+        } else if let Some(value) = arg.strip_prefix("--src=") {
+            *arg = format!("--image={value}");
+        }
+    }
+    args
 }
 
 pub(crate) fn without_attachment_lines(content: &str, attachment_urls: &[String]) -> String {
@@ -267,12 +287,12 @@ mod tests {
         let r = parse(r"@mage edit --src C:\pics\cat.png add a hat").unwrap();
         assert_eq!(
             r.args,
-            ["edit", "--src", r"C:\pics\cat.png", "add", "a", "hat"]
+            ["generate", "--image", r"C:\pics\cat.png", "add", "a", "hat"]
         );
         let r = parse(r#"@mage edit --src "C:\My Pics\cat.png" add a hat"#).unwrap();
         assert_eq!(r.args[2], r"C:\My Pics\cat.png");
         let r = parse(r"@mage edit --src='D:\a b\c.png' x").unwrap();
-        assert_eq!(r.args[1], r"--src=D:\a b\c.png");
+        assert_eq!(r.args[1], r"--image=D:\a b\c.png");
     }
 
     #[test]
@@ -300,8 +320,8 @@ mod tests {
         assert_eq!(
             r.args,
             [
-                "edit",
-                "--src",
+                "generate",
+                "--image",
                 "bee-garden:assets/f4e3.jpg",
                 "change the fox to blue"
             ]
@@ -324,6 +344,6 @@ mod tests {
         let url = "https://relay.example/media/abc.png".to_string();
         let content = format!("@mage edit make it blue\n![photo.png]({url})");
         let r = parse_request(&content, &[url], Some("mage")).unwrap();
-        assert_eq!(r.args, ["edit", "make", "it", "blue"]);
+        assert_eq!(r.args, ["generate", "make", "it", "blue"]);
     }
 }

@@ -186,17 +186,27 @@ pub fn update_controls(
     harness_file: &Path,
     change: impl FnOnce(&mut Vec<Value>) -> bool,
 ) -> Result<bool, String> {
+    update_composer(harness_file, |composer| {
+        composer
+            .get_mut("controls")
+            .and_then(Value::as_array_mut)
+            .is_some_and(change)
+    })
+}
+
+/// Rewrites the harness file's `composer` block when `change` reports a change.
+pub fn update_composer(
+    harness_file: &Path,
+    change: impl FnOnce(&mut Value) -> bool,
+) -> Result<bool, String> {
     let raw = std::fs::read_to_string(harness_file)
         .map_err(|e| format!("{}: {e}", harness_file.display()))?;
     let mut harness: Value = serde_json::from_str(raw.trim_start_matches('\u{feff}'))
         .map_err(|e| format!("{}: {e}", harness_file.display()))?;
-    let Some(controls) = harness
-        .pointer_mut("/composer/controls")
-        .and_then(Value::as_array_mut)
-    else {
+    let Some(composer) = harness.get_mut("composer").filter(|c| c.is_object()) else {
         return Ok(false);
     };
-    if !change(controls) {
+    if !change(composer) {
         return Ok(false);
     }
     let out = serde_json::to_string_pretty(&harness).map_err(|e| e.to_string())?;
