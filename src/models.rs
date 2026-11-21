@@ -124,7 +124,9 @@ pub fn parse(text: &str) -> Vec<Model> {
                     .map(str::to_ascii_uppercase)
                     .filter(|r| resolutions.contains(r)),
                 speed: get("speed").map(capitalized),
-                max_refs: get("max_refs").and_then(|n| n.trim().parse().ok()).filter(|n| *n > 0),
+                max_refs: get("max_refs")
+                    .and_then(|n| n.trim().parse().ok())
+                    .filter(|n| *n > 0),
                 assets: !get("assets").is_some_and(|a| a.eq_ignore_ascii_case("no")),
                 id,
                 architecture,
@@ -159,6 +161,33 @@ fn union<'a>(lists: impl Iterator<Item = &'a Vec<String>>) -> Vec<String> {
 /// `{"model": [ids]}`, or nothing when every model in `of` qualifies.
 fn when_models(ids: &[&str], of: &[&str]) -> Option<Value> {
     (ids.len() < of.len()).then(|| json!({ "model": ids }))
+}
+
+/// The common ratio nearest a size (Mango's 896×1152 portrait is 3:4), shown
+/// under each aspect's name.
+fn nominal_ratio([width, height]: [u32; 2]) -> String {
+    const RATIOS: [(u32, u32); 11] = [
+        (1, 1),
+        (4, 3),
+        (3, 4),
+        (3, 2),
+        (2, 3),
+        (16, 9),
+        (9, 16),
+        (21, 9),
+        (9, 21),
+        (2, 1),
+        (1, 2),
+    ];
+    let actual = f64::from(width) / f64::from(height.max(1));
+    let (w, h) = RATIOS
+        .into_iter()
+        .min_by(|a, b| {
+            let off = |(w, h): (u32, u32)| (f64::from(w) / f64::from(h) - actual).abs();
+            off(*a).total_cmp(&off(*b))
+        })
+        .unwrap_or((1, 1));
+    format!("{w}:{h}")
 }
 
 fn auto() -> Value {
@@ -226,6 +255,7 @@ pub fn controls(models: &[Model]) -> Option<[Value; 3]> {
                     });
                 if let Some(base) = base {
                     option["size"] = json!(base);
+                    option["hint"] = nominal_ratio(base).into();
                 }
                 if let Some(when) = when_models(&ids, &all) {
                     option["when"] = when;
@@ -430,8 +460,14 @@ mod tests {
 
     /// mage 0.7's image keys on top of `INI`.
     fn with_image_keys() -> String {
-        INI.replace("speed=slow\n[flux2-dev]", "max_refs=10\nassets=yes\nspeed=slow\n[flux2-dev]")
-            .replace("speed=slow\n[clip]", "max_refs=3\nassets=no\nspeed=slow\n[clip]")
+        INI.replace(
+            "speed=slow\n[flux2-dev]",
+            "max_refs=10\nassets=yes\nspeed=slow\n[flux2-dev]",
+        )
+        .replace(
+            "speed=slow\n[clip]",
+            "max_refs=3\nassets=no\nspeed=slow\n[clip]",
+        )
     }
 
     #[test]
@@ -522,6 +558,11 @@ mod tests {
 
         let portrait = &aspect["options"][1];
         assert_eq!(portrait["size"], json!([896, 1152]));
+        assert_eq!(portrait["hint"], "3:4");
+        assert_eq!(nominal_ratio([1216, 832]), "3:2");
+        assert_eq!(nominal_ratio([1344, 768]), "16:9");
+        assert_eq!(nominal_ratio([1152, 896]), "4:3");
+        assert_eq!(nominal_ratio([1024, 1024]), "1:1");
         assert!(portrait.get("when").is_none());
         assert_eq!(
             portrait["sizes"],

@@ -155,8 +155,8 @@ mod tests {
         assert_eq!(
             r.args,
             [
-                "generate", "--prompt", "a cat", "--model", "mango-v4", "--aspect", "portrait", "--res",
-                "1K"
+                "generate", "--prompt", "a cat", "--model", "mango-v4", "--aspect", "portrait",
+                "--res", "1K"
             ]
         );
         assert_eq!(r.repo, None);

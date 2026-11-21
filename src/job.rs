@@ -83,7 +83,7 @@ pub fn run(config: &Config, event: &Event, reply_to: Option<&str>) {
             work.display()
         )),
     };
-    post(config, &event.channel, reply_to, message);
+    post(config, event, reply_to, message);
     let _ = std::fs::remove_dir_all(&work);
 }
 
@@ -460,26 +460,31 @@ fn attachable(images: &[PathBuf], work: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// `messages send --file` appends `\n![name](url)` per file, so a trailing
-/// newline puts the attachments in their own paragraph, a paragraph gap below
-/// the text. With no text, the attachments start the message.
-fn with_attachment_gap(content: &str, has_files: bool) -> String {
-    if !has_files {
-        return content.to_string();
-    }
-    let text = content.trim_end();
-    if text.is_empty() {
-        String::new()
-    } else {
-        format!("{text}\n")
+/// The reply opens with the requester's name, as a text agent's does.
+/// `messages send --file` puts each file on the next line.
+fn addressed(mention: &str, content: &str) -> String {
+    let text = content.trim();
+    match (mention.is_empty(), text.is_empty()) {
+        (true, _) => text.to_string(),
+        (false, true) => mention.to_string(),
+        (false, false) => format!("{mention} {text}"),
     }
 }
 
-fn post(config: &Config, channel: &str, reply_to: Option<&str>, reply: Reply) {
+fn post(config: &Config, event: &Event, reply_to: Option<&str>, reply: Reply) {
     let send = |content: &str, files: &[PathBuf]| {
-        let content = with_attachment_gap(content, !files.is_empty());
+        let content = addressed(&event.sender_mention, content);
         let mut cmd = proc::command(&config.buzz);
-        cmd.args(["messages", "send", "--channel", channel, "--content", "-"]);
+        cmd.args([
+            "messages",
+            "send",
+            "--channel",
+            &event.channel,
+            "--mention",
+            &event.sender,
+            "--content",
+            "-",
+        ]);
         if let Some(id) = reply_to {
             cmd.args(["--reply-to", id]);
         }
@@ -648,10 +653,13 @@ mod tests {
     }
 
     #[test]
-    fn attachments_get_their_own_paragraph() {
-        assert_eq!(with_attachment_gap("Saved to x\n\n", true), "Saved to x\n");
-        assert_eq!(with_attachment_gap(" \n", true), "");
-        assert_eq!(with_attachment_gap("no image", false), "no image");
+    fn replies_open_with_the_requester() {
+        assert_eq!(addressed("@Alex", ""), "@Alex");
+        assert_eq!(addressed("", "done"), "done");
+        assert_eq!(
+            addressed("@Alex", "Repo save failed: x\n"),
+            "@Alex Repo save failed: x"
+        );
     }
 
     #[test]

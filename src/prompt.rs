@@ -10,6 +10,9 @@ pub struct Event {
     pub channel: String,
     /// The signer's hex pubkey, from the `From:` line.
     pub sender: String,
+    /// How a reply names the signer: `@<label>`, or `nostr:<npub>` when the
+    /// `From:` line has no label.
+    pub sender_mention: String,
     pub content: String,
     pub tags: Vec<Vec<String>>,
 }
@@ -95,6 +98,16 @@ fn sender_hex(display: &str) -> Option<String> {
     is_hex64(hex).then(|| hex.to_ascii_lowercase())
 }
 
+/// `@<label>` for `<label> (npub: …)`, `nostr:<npub>` for `<npub> (hex: …)`.
+fn sender_mention(display: &str) -> Option<String> {
+    if let Some((label, _)) = display.rsplit_once(" (npub: ") {
+        let label = label.trim();
+        return (!label.is_empty()).then(|| format!("@{label}"));
+    }
+    let npub = display.split_once(" (hex: ")?.0.trim();
+    npub.starts_with("npub1").then(|| format!("nostr:{npub}"))
+}
+
 fn section_body<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     let open = format!("<{tag}>\n");
     let close = format!("\n</{tag}>");
@@ -157,7 +170,9 @@ fn parse_event_block(block: &str) -> Option<(Event, usize)> {
     let id = lines.next()?.strip_prefix("Event ID: ")?.trim().to_string();
     let channel = channel_uuid(lines.next()?.strip_prefix("Channel: ")?)?;
     lines.next()?.strip_prefix("Kind: ")?;
-    let sender = sender_hex(lines.next()?.strip_prefix("From: ")?)?;
+    let from = lines.next()?.strip_prefix("From: ")?;
+    let sender = sender_hex(from)?;
+    let sender_mention = sender_mention(from).unwrap_or_default();
     lines.next()?.strip_prefix("Time: ")?;
     let tail = lines.next()?.strip_prefix("Content: ")?;
     let tail_offset = block.len() - tail.len();
@@ -173,6 +188,7 @@ fn parse_event_block(block: &str) -> Option<(Event, usize)> {
                 id,
                 channel,
                 sender,
+                sender_mention,
                 content: tail[..cursor + found].to_string(),
                 tags,
             };
@@ -219,6 +235,20 @@ mod tests {
     }
 
     #[test]
+    fn replies_name_the_sender_by_label_or_npub() {
+        let hex = "a".repeat(64);
+        assert_eq!(
+            sender_mention(&format!("Alex Rivera (npub: npub1x, hex: {hex})")).as_deref(),
+            Some("@Alex Rivera")
+        );
+        assert_eq!(
+            sender_mention(&format!("npub1x (hex: {hex})")).as_deref(),
+            Some("nostr:npub1x")
+        );
+        assert_eq!(sender_mention(&format!("x (hex: {hex})")), None);
+    }
+
+    #[test]
     fn sender_comes_from_either_from_form() {
         let hex = SENDER.to_uppercase();
         assert_eq!(
@@ -247,6 +277,7 @@ mod tests {
             id: id.to_string(),
             channel: CH.to_string(),
             sender: SENDER.to_string(),
+            sender_mention: "@Alex".to_string(),
             content: String::new(),
             tags: tags
                 .iter()
