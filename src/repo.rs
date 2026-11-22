@@ -288,6 +288,7 @@ pub fn save(
     target: &Target,
     images: &[PathBuf],
     sidecars: &[PathBuf],
+    sources: &[(PathBuf, String)],
     message: &str,
 ) -> Result<Saved, String> {
     let repo = &target.repo;
@@ -306,6 +307,20 @@ pub fn save(
     )?;
     let mut entries = Vec::new();
     for (src, rel) in &placed {
+        let oid = git(
+            &clone,
+            &[
+                "hash-object",
+                "-w",
+                "--no-filters",
+                "--",
+                &src.to_string_lossy(),
+            ],
+        )
+        .map_err(|e| format!("could not add {rel}: {e}"))?;
+        entries.push((oid, rel.as_str()));
+    }
+    for (src, rel) in sources {
         let oid = git(
             &clone,
             &[
@@ -626,7 +641,7 @@ mod tests {
             path: "assets".into(),
         };
         let message = "@Mage gen a fox --repo assets\n\n# kept verbatim";
-        let saved = save(&work, &target, &images, &sidecars, message).unwrap();
+        let saved = save(&work, &target, &images, &sidecars, &[], message).unwrap();
         assert_eq!(saved.files, ["assets/h1.jpg", "assets/h1.json"]);
 
         let listing = git(
@@ -673,11 +688,28 @@ mod tests {
             repo,
             path: "img/fox.png".into(),
         };
-        let saved = save(&root.join("work"), &target, &images, &sidecars, "first").unwrap();
+        let source = root.join("source.png");
+        std::fs::write(&source, b"source bytes").unwrap();
+        let sources = [(source, format!(".sources/{}.png", "ab".repeat(32)))];
+        let saved = save(
+            &root.join("work"),
+            &target,
+            &images,
+            &sidecars,
+            &sources,
+            "first",
+        )
+        .unwrap();
         assert_eq!(saved.files, ["img/fox.jpg", "img/fox.json"]);
         let bare = root.join("remote.git");
         let tree = git(&bare, &["ls-tree", "-r", "--name-only", "main"]).unwrap();
-        assert_eq!(tree, "img/fox.jpg\nimg/fox.json");
+        assert_eq!(
+            tree,
+            format!(
+                ".sources/{}.png\nimg/fox.jpg\nimg/fox.json",
+                "ab".repeat(32)
+            )
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

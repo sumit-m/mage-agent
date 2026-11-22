@@ -267,10 +267,80 @@ fn save_to_repo(
     let target = repo::resolve_for(&config.buzz, &event.channel, &event.sender, spec)?;
     let mut saved_origin = save.origin.clone();
     saved_origin["repo"] = repo_address(&target.repo).into();
+    let sources = source_files(config, work, &mut saved_origin);
     annotate_sidecars(save.sidecars, &saved_origin);
-    repo::save(work, &target, save.images, save.sidecars, save.message)
-        .map(|_| ())
-        .inspect_err(|_| annotate_sidecars(save.sidecars, save.origin))
+    repo::save(
+        work,
+        &target,
+        save.images,
+        save.sidecars,
+        &sources,
+        save.message,
+    )
+    .map(|_| ())
+    .inspect_err(|_| annotate_sidecars(save.sidecars, save.origin))
+}
+
+/// Each source upload, fetched again to be committed once per repo at
+/// `.sources/<sha256>.<ext>`; its entry in `origin` names that `path`, so the
+/// saved file can be made again after the upload is gone. A source that
+/// can't be fetched keeps only its upload.
+fn source_files(config: &Config, work: &Path, origin: &mut Value) -> Vec<(PathBuf, String)> {
+    let Some(sources) = origin.get_mut("sources").and_then(Value::as_array_mut) else {
+        return Vec::new();
+    };
+    let dir = work.join("sources");
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
+    for source in sources.iter_mut() {
+        let (Some(url), Some(sha)) = (source["url"].as_str(), source["x"].as_str()) else {
+            continue;
+        };
+        if !crate::prompt::is_hex64(sha) {
+            continue;
+        }
+        let sha = sha.to_ascii_lowercase();
+        let ext = source_extension(source["m"].as_str().unwrap_or_default());
+        let path = format!(".sources/{sha}.{ext}");
+        let fetched = files.iter().any(|(_, known)| *known == path)
+            || fetch_source(config, url, &dir.join(format!("{sha}.{ext}")))
+                .map(|file| files.push((file, path.clone())))
+                .is_ok();
+        if fetched {
+            source["path"] = path.into();
+        }
+    }
+    if let Some(first) = origin["sources"].get(0).cloned() {
+        origin["source"] = first;
+    }
+    files
+}
+
+/// The extension a source is committed under. Buzz Desktop derives the same
+/// one for a source whose entry names no `path`.
+fn source_extension(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        m if m.starts_with("video/") => "mp4",
+        _ => "jpg",
+    }
+}
+
+fn fetch_source(config: &Config, url: &str, path: &Path) -> Result<PathBuf, String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut cmd = proc::command(&config.buzz);
+    cmd.args(["media", "get", url, "--output"]).arg(path);
+    let out = proc::run(cmd, None, BUZZ_TIMEOUT).map_err(|e| e.to_string())?;
+    if out.success {
+        Ok(path.to_path_buf())
+    } else {
+        Err(out.failure_text())
+    }
 }
 
 fn repo_address(repo: &repo::RepoInfo) -> String {
