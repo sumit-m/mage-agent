@@ -190,6 +190,15 @@ fn nominal_ratio([width, height]: [u32; 2]) -> String {
     format!("{w}:{h}")
 }
 
+/// An aspect already named by its ratio (`16:9`), which needs no hint.
+fn is_ratio(aspect: &str) -> bool {
+    aspect.split_once(':').is_some_and(|(w, h)| {
+        [w, h]
+            .iter()
+            .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
 fn auto() -> Value {
     json!({ "value": "auto", "label": "Auto", "when": { "@images": ["attached"] } })
 }
@@ -255,7 +264,9 @@ pub fn controls(models: &[Model]) -> Option<[Value; 3]> {
                     });
                 if let Some(base) = base {
                     option["size"] = json!(base);
-                    option["hint"] = nominal_ratio(base).into();
+                    if !is_ratio(&aspect) {
+                        option["hint"] = nominal_ratio(base).into();
+                    }
                 }
                 if let Some(when) = when_models(&ids, &all) {
                     option["when"] = when;
@@ -522,6 +533,33 @@ mod tests {
         assert_eq!(character["when"], json!({ "model": ["mango-v4"] }));
         assert!(!refresh(&file, &ini).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ratio_named_aspects_get_no_hint() {
+        let ini = format!(
+            "{INI}[grok-image]\n\
+             architecture=grok_image\n\
+             aspects=16:9,20:9\n\
+             resolutions=1k\n\
+             aspect_size_1k=1280x720,1280x576\n"
+        );
+        let [_, aspect, _] = controls(&parse(&ini)).unwrap();
+        let option = |value: &str| {
+            aspect["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|o| o["value"] == value)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(option("portrait")["hint"], "3:4");
+        for value in ["16:9", "20:9"] {
+            assert!(option(value).get("hint").is_none());
+            assert_eq!(option(value)["label"], value);
+        }
+        assert_eq!(option("20:9")["size"], json!([1280, 576]));
     }
 
     #[test]
